@@ -80,12 +80,13 @@ class TurboQuantKVCache:
     """
 
     def __init__(self, num_layers: int, batch_size: int, num_heads: int,
-                 max_seq_len: int, head_dim: int,
+                 head_dim: int,
                  bits: int = 4,
                  k_bits: int | None = None,
                  v_bits: int | None = None,
                  m: int | None = None,
                  num_kv_heads: int | None = None,
+                 max_seq_len: int | None = None,
                  seed: int = 0,
                  device: torch.device | None = None,
                  dtype: torch.dtype = torch.float32):
@@ -96,6 +97,10 @@ class TurboQuantKVCache:
         K budget should be conservative (errors feed into softmax). V can be much smaller
         (errors average out through attn @ V, and Lloyd-Max centroids are unbiased).
         Pass either `bits` (sets both) or `k_bits` / `v_bits` to override individually.
+
+        `max_seq_len` is optional: if provided, buffers are pre-allocated to that size
+        (and overflow is an error). If None, buffers grow on demand (capacity doubles
+        on overflow).
         """
         self.num_layers = num_layers
         self.batch_size = batch_size
@@ -103,8 +108,8 @@ class TurboQuantKVCache:
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         assert num_heads % self.num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
         self.n_rep = num_heads // self.num_kv_heads
-        self.max_seq_len = max_seq_len
         self.head_dim = head_dim
+        self.max_seq_len = max_seq_len              # optional hard cap
 
         # User-facing total budgets per coordinate.
         self.k_total_bits = k_bits if k_bits is not None else bits
@@ -117,6 +122,12 @@ class TurboQuantKVCache:
         self.device = device
         self.dtype = dtype
 
+        # Pre-compute trailing storage sizes (so bytes_per_token is buffer-independent).
+        self._bytes_k_idx  = (head_dim * self.k_bits + 7) // 8
+        self._bytes_v_idx  = (head_dim * self.v_bits + 7) // 8
+        self._bytes_k_sign = (self.m + 7) // 8
+        self._fp_bytes = torch.empty((), dtype=dtype).element_size()
+
         self.k_quantizers = [
             TurboQuant(self.k_total_bits, head_dim, self.m, seed=seed + 2 * l,
                        device=device, dtype=dtype)
@@ -128,42 +139,70 @@ class TurboQuantKVCache:
             for l in range(num_layers)
         ]
 
-        L, B, H_kv, T = num_layers, batch_size, self.num_kv_heads, max_seq_len
-        bytes_k_idx  = (head_dim * self.k_bits + 7) // 8
-        bytes_v_idx  = (head_dim * self.v_bits + 7) // 8
-        bytes_k_sign = (self.m + 7) // 8
-
-        self.k_norm           = torch.zeros(L, B, H_kv, T,                device=device, dtype=dtype)
-        self.k_idx_packed     = torch.zeros(L, B, H_kv, T, bytes_k_idx,   device=device, dtype=torch.uint8)
-        self.k_resnorm        = torch.zeros(L, B, H_kv, T,                device=device, dtype=dtype)
-        self.k_ressign_packed = torch.zeros(L, B, H_kv, T, bytes_k_sign,  device=device, dtype=torch.uint8)
-        self.v_norm           = torch.zeros(L, B, H_kv, T,                device=device, dtype=dtype)
-        self.v_idx_packed     = torch.zeros(L, B, H_kv, T, bytes_v_idx,   device=device, dtype=torch.uint8)
+        # Buffers allocated lazily by _grow.
+        self.k_norm           = None
+        self.k_idx_packed     = None
+        self.k_resnorm        = None
+        self.k_ressign_packed = None
+        self.v_norm           = None
+        self.v_idx_packed     = None
+        self._capacity = 0
         self.cur_len = [0] * num_layers
 
+        if max_seq_len is not None:
+            self._grow(max_seq_len)
+
+    def _grow(self, target: int) -> None:
+        """Ensure buffers can hold at least `target` tokens. Doubles capacity on overflow."""
+        if target <= self._capacity:
+            return
+        if self.max_seq_len is not None and target > self.max_seq_len:
+            raise AssertionError(f"exceeded max_seq_len ({target} > {self.max_seq_len})")
+        new_cap = max(target, max(self._capacity * 2, 16))
+        if self.max_seq_len is not None:
+            new_cap = min(new_cap, self.max_seq_len)
+
+        L, B, H_kv = self.num_layers, self.batch_size, self.num_kv_heads
+        fields = [
+            ("k_norm",           self.dtype,      ()),
+            ("k_idx_packed",     torch.uint8,     (self._bytes_k_idx,)),
+            ("k_resnorm",        self.dtype,      ()),
+            ("k_ressign_packed", torch.uint8,     (self._bytes_k_sign,)),
+            ("v_norm",           self.dtype,      ()),
+            ("v_idx_packed",     torch.uint8,     (self._bytes_v_idx,)),
+        ]
+        for name, dtype, trailing in fields:
+            new = torch.zeros(L, B, H_kv, new_cap, *trailing, device=self.device, dtype=dtype)
+            old = getattr(self, name)
+            if old is not None and self._capacity > 0:
+                new[:, :, :, : self._capacity] = old
+            setattr(self, name, new)
+        self._capacity = new_cap
+
     def reset(self) -> None:
+        """Reset write cursors. Keeps allocated capacity so subsequent fills are allocation-free."""
         self.cur_len = [0] * self.num_layers
 
     def bytes_per_token(self) -> int:
         """Per-(layer, kv-head, token) storage cost in bytes."""
-        fp_bytes = self.k_norm.element_size()
         return (
-            2 * fp_bytes
-            + self.k_idx_packed.shape[-1]
-            + self.k_ressign_packed.shape[-1]
-            + fp_bytes
-            + self.v_idx_packed.shape[-1]
+            2 * self._fp_bytes                      # k_norm + k_resnorm
+            + self._bytes_k_idx
+            + self._bytes_k_sign
+            + self._fp_bytes                        # v_norm
+            + self._bytes_v_idx
         )
 
     def bytes_total(self) -> int:
+        """Total currently-allocated bytes (based on current capacity, not cur_len)."""
         return (self.num_layers * self.batch_size * self.num_kv_heads
-                * self.max_seq_len * self.bytes_per_token())
+                * self._capacity * self.bytes_per_token())
 
     def update(self, layer_idx: int, k_new: torch.Tensor, v_new: torch.Tensor) -> int:
         """k_new, v_new: [B, H, T_new, D]. Returns total seq len for the layer."""
         T_new = k_new.shape[-2]
         s, e = self.cur_len[layer_idx], self.cur_len[layer_idx] + T_new
-        assert e <= self.max_seq_len, f"exceeded max_seq_len ({e} > {self.max_seq_len})"
+        self._grow(e)
 
         kq = self.k_quantizers[layer_idx].quantize(k_new)
         self.k_norm[layer_idx, :, :, s:e]    = kq.x_norm
