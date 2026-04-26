@@ -1,0 +1,305 @@
+"""TurboAttention via HF's ALL_ATTENTION_FUNCTIONS dispatcher.
+
+Replaces only the SDPA step. Q/K/V come in already RoPE'd, QK-normed, GQA-grouped
+(we expand K/V heads here), so RoPE / QK-norm / sliding window / etc. flow through
+unchanged. Output goes back into the model's o_proj path unchanged.
+"""
+
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from polar_quant import PolarQuant
+from turbo_quant import QuantizedKV, TurboQuant
+
+
+# --------------------------------------------------------------------------------------
+# bit packing
+# --------------------------------------------------------------------------------------
+
+def pack_bits(x: torch.Tensor, bits: int) -> torch.Tensor:
+    """Pack N integer values (each in [0, 2**bits)) along the last dim.
+    x: [..., N] -> [..., ceil(N*bits/8)] uint8."""
+    if bits == 8:
+        return x.to(torch.uint8)
+    *prefix, N = x.shape
+    x = x.long()
+    bit_idx = torch.arange(bits, device=x.device, dtype=torch.long)
+    bits_t = (x.unsqueeze(-1) >> bit_idx) & 1                           # [..., N, bits]
+    flat = bits_t.reshape(*prefix, N * bits)
+    pad = (-flat.shape[-1]) % 8
+    if pad:
+        flat = F.pad(flat, (0, pad))
+    flat = flat.reshape(*prefix, -1, 8)
+    weights = 1 << torch.arange(8, device=x.device, dtype=torch.long)
+    return (flat * weights).sum(dim=-1).to(torch.uint8)
+
+
+def unpack_bits(packed: torch.Tensor, bits: int, N: int) -> torch.Tensor:
+    """Reverse pack_bits. packed:[..., n_bytes] uint8 -> [..., N] uint8."""
+    if bits == 8:
+        return packed[..., :N]
+    *prefix, n_bytes = packed.shape
+    bit_idx = torch.arange(8, device=packed.device, dtype=torch.long)
+    flat = (packed.long().unsqueeze(-1) >> bit_idx) & 1                 # [..., n_bytes, 8]
+    flat = flat.reshape(*prefix, n_bytes * 8)[..., : N * bits]
+    flat = flat.reshape(*prefix, N, bits)
+    weights = 1 << torch.arange(bits, device=packed.device, dtype=torch.long)
+    return (flat * weights).sum(dim=-1).to(torch.uint8)
+
+
+# --------------------------------------------------------------------------------------
+# KV cache
+# --------------------------------------------------------------------------------------
+
+def _repeat_head(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Expand a tensor along dim=1 (head dim) by n_rep. Works for any trailing shape."""
+    if n_rep == 1:
+        return x
+    B, H, *rest = x.shape
+    return (x.unsqueeze(2)
+              .expand(B, H, n_rep, *rest)
+              .reshape(B, H * n_rep, *rest))
+
+
+class TurboQuantKVCache:
+    """KV cache with bit-packed TurboQuant K and PolarQuant V storage.
+
+    Storage is at **kv-head** granularity (so GQA savings are preserved). Attention
+    expansion to query-head count happens at compute time.
+
+    Per-layer layout (`H_kv` = num_kv_heads):
+        k_norm           : [L, B, H_kv, T]                     fp
+        k_idx_packed     : [L, B, H_kv, T, ceil(D*(bits-1)/8)] uint8
+        k_resnorm        : [L, B, H_kv, T]                     fp
+        k_ressign_packed : [L, B, H_kv, T, ceil(m/8)]          uint8
+        v_norm           : [L, B, H_kv, T]                     fp
+        v_idx_packed     : [L, B, H_kv, T, ceil(D*bits/8)]     uint8
+    """
+
+    def __init__(self, num_layers: int, batch_size: int, num_heads: int,
+                 max_seq_len: int, head_dim: int,
+                 bits: int = 4,
+                 k_bits: int | None = None,
+                 v_bits: int | None = None,
+                 m: int | None = None,
+                 num_kv_heads: int | None = None,
+                 seed: int = 0,
+                 device: torch.device | None = None,
+                 dtype: torch.dtype = torch.float32):
+        """K uses TurboQuant with `k_bits` total budget per coordinate (k_bits-1 for the
+        Lloyd-Max codebook + 1 for the JL residual sketch, with m JL projections).
+        V uses PolarQuant with `v_bits` per coordinate.
+
+        K budget should be conservative (errors feed into softmax). V can be much smaller
+        (errors average out through attn @ V, and Lloyd-Max centroids are unbiased).
+        Pass either `bits` (sets both) or `k_bits` / `v_bits` to override individually.
+        """
+        self.num_layers = num_layers
+        self.batch_size = batch_size
+        self.num_heads = num_heads                  # query-head count
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        assert num_heads % self.num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
+        self.n_rep = num_heads // self.num_kv_heads
+        self.max_seq_len = max_seq_len
+        self.head_dim = head_dim
+
+        # User-facing total budgets per coordinate.
+        self.k_total_bits = k_bits if k_bits is not None else bits
+        self.v_total_bits = v_bits if v_bits is not None else bits
+        # Internal storage bits: K uses (total - 1) for MSE indices (1 bit goes to JL sketch),
+        # V uses all bits for PolarQuant.
+        self.k_bits = self.k_total_bits - 1
+        self.v_bits = self.v_total_bits
+        self.m = m if m is not None else head_dim
+        self.device = device
+        self.dtype = dtype
+
+        self.k_quantizers = [
+            TurboQuant(self.k_total_bits, head_dim, self.m, seed=seed + 2 * l,
+                       device=device, dtype=dtype)
+            for l in range(num_layers)
+        ]
+        self.v_quantizers = [
+            PolarQuant(self.v_total_bits, head_dim, seed=seed + 2 * l + 1,
+                       device=device, dtype=dtype)
+            for l in range(num_layers)
+        ]
+
+        L, B, H_kv, T = num_layers, batch_size, self.num_kv_heads, max_seq_len
+        bytes_k_idx  = (head_dim * self.k_bits + 7) // 8
+        bytes_v_idx  = (head_dim * self.v_bits + 7) // 8
+        bytes_k_sign = (self.m + 7) // 8
+
+        self.k_norm           = torch.zeros(L, B, H_kv, T,                device=device, dtype=dtype)
+        self.k_idx_packed     = torch.zeros(L, B, H_kv, T, bytes_k_idx,   device=device, dtype=torch.uint8)
+        self.k_resnorm        = torch.zeros(L, B, H_kv, T,                device=device, dtype=dtype)
+        self.k_ressign_packed = torch.zeros(L, B, H_kv, T, bytes_k_sign,  device=device, dtype=torch.uint8)
+        self.v_norm           = torch.zeros(L, B, H_kv, T,                device=device, dtype=dtype)
+        self.v_idx_packed     = torch.zeros(L, B, H_kv, T, bytes_v_idx,   device=device, dtype=torch.uint8)
+        self.cur_len = [0] * num_layers
+
+    def reset(self) -> None:
+        self.cur_len = [0] * self.num_layers
+
+    def bytes_per_token(self) -> int:
+        """Per-(layer, kv-head, token) storage cost in bytes."""
+        fp_bytes = self.k_norm.element_size()
+        return (
+            2 * fp_bytes
+            + self.k_idx_packed.shape[-1]
+            + self.k_ressign_packed.shape[-1]
+            + fp_bytes
+            + self.v_idx_packed.shape[-1]
+        )
+
+    def bytes_total(self) -> int:
+        return (self.num_layers * self.batch_size * self.num_kv_heads
+                * self.max_seq_len * self.bytes_per_token())
+
+    def update(self, layer_idx: int, k_new: torch.Tensor, v_new: torch.Tensor) -> int:
+        """k_new, v_new: [B, H, T_new, D]. Returns total seq len for the layer."""
+        T_new = k_new.shape[-2]
+        s, e = self.cur_len[layer_idx], self.cur_len[layer_idx] + T_new
+        assert e <= self.max_seq_len, f"exceeded max_seq_len ({e} > {self.max_seq_len})"
+
+        kq = self.k_quantizers[layer_idx].quantize(k_new)
+        self.k_norm[layer_idx, :, :, s:e]    = kq.x_norm
+        self.k_resnorm[layer_idx, :, :, s:e] = kq.res_norm
+        self.k_idx_packed[layer_idx, :, :, s:e]     = pack_bits(kq.x_indices, self.k_bits)
+        sign01 = (kq.res_signs.long() + 1) >> 1                         # {-1,+1} -> {0,1}
+        self.k_ressign_packed[layer_idx, :, :, s:e] = pack_bits(sign01, 1)
+
+        v_norm, v_idx = self.v_quantizers[layer_idx].encode(v_new)
+        self.v_norm[layer_idx, :, :, s:e]       = v_norm
+        self.v_idx_packed[layer_idx, :, :, s:e] = pack_bits(v_idx, self.v_bits)
+
+        self.cur_len[layer_idx] = e
+        return e
+
+    def _key_view(self, layer_idx: int, T: int) -> QuantizedKV:
+        """Unpack K view at kv-head granularity and expand to query-head count."""
+        k_idx = unpack_bits(self.k_idx_packed[layer_idx, :, :, :T],
+                            self.k_bits, self.head_dim)              # [B, H_kv, T, D]
+        sign01 = unpack_bits(self.k_ressign_packed[layer_idx, :, :, :T], 1, self.m)
+        signs = sign01.to(torch.int8) * 2 - 1                        # [B, H_kv, T, m]
+        x_norm   = self.k_norm[layer_idx, :, :, :T]                  # [B, H_kv, T]
+        res_norm = self.k_resnorm[layer_idx, :, :, :T]               # [B, H_kv, T]
+
+        if self.n_rep > 1:
+            x_norm   = _repeat_head(x_norm,   self.n_rep)
+            k_idx    = _repeat_head(k_idx,    self.n_rep)
+            res_norm = _repeat_head(res_norm, self.n_rep)
+            signs    = _repeat_head(signs,    self.n_rep)
+
+        return QuantizedKV(
+            x_norm=x_norm,
+            x_indices=k_idx,
+            res_norm=res_norm,
+            res_signs=signs,
+        )
+
+    def attention(self, layer_idx: int, q: torch.Tensor,
+                  scaling: float | None = None,
+                  attn_mask: torch.Tensor | None = None,
+                  causal: bool = True) -> torch.Tensor:
+        """q: [B, H_q, Q, D] -> [B, H_q, Q, D].
+
+        scaling   : if None, defaults to 1/sqrt(head_dim).
+        attn_mask : additive mask broadcastable to [B, H, Q, T]. If provided,
+                    `causal` is ignored (mask is assumed to already encode causality).
+        """
+        T = self.cur_len[layer_idx]
+        D = self.head_dim
+        if scaling is None:
+            scaling = 1.0 / math.sqrt(D)
+
+        kq_view = self._key_view(layer_idx, T)
+        scores = self.k_quantizers[layer_idx].estimate_ip_pairwise(kq_view, q) * scaling
+
+        if attn_mask is not None:
+            scores = scores + attn_mask[..., :scores.shape[-1]]
+        elif causal:
+            Qn = q.shape[-2]
+            base = T - Qn
+            i = torch.arange(Qn, device=q.device).unsqueeze(1)
+            j = torch.arange(T,  device=q.device).unsqueeze(0)
+            scores = scores.masked_fill(j > (base + i), float("-inf"))
+
+        attn = F.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+        v_idx = unpack_bits(self.v_idx_packed[layer_idx, :, :, :T], self.v_bits, D)
+        V = self.v_quantizers[layer_idx].decode(self.v_norm[layer_idx, :, :, :T], v_idx)  # [B, H_kv, T, D]
+        if self.n_rep > 1:
+            V = _repeat_head(V, self.n_rep)
+        return attn @ V
+
+
+# --------------------------------------------------------------------------------------
+# HF ALL_ATTENTION_FUNCTIONS integration
+# --------------------------------------------------------------------------------------
+
+def turbo_attn_function(module, query, key, value, attention_mask=None,
+                        scaling=None, dropout=0.0, **kwargs):
+    """HF ALL_ATTENTION_FUNCTIONS callable.
+
+    Inputs (already RoPE'd / QK-normed by the calling attention module):
+        query : [B, H_q,  T_q, D]
+        key   : [B, H_kv, T_k, D]
+        value : [B, H_kv, T_k, D]
+    Returns: (attn_output [B, T_q, H_q, D], None)  per HF contract.
+
+    K and V are stored at kv-head granularity (preserving GQA savings); the cache
+    expands to query-head count internally during attention.
+    """
+    cache: TurboQuantKVCache = module._turbo_cache
+    layer_idx: int = module.layer_idx
+
+    cache.update(layer_idx, key, value)
+    out = cache.attention(layer_idx, query,
+                          scaling=scaling, attn_mask=attention_mask)
+
+    # HF expects [B, T, H, D] from an attn_fn (the caller does the final reshape + o_proj).
+    out = out.transpose(1, 2).contiguous()
+    return out, None
+
+
+# Register at import time so users can pick "turbo" via `attn_implementation`.
+try:
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    ALL_ATTENTION_FUNCTIONS["turbo"] = turbo_attn_function
+except ImportError:
+    ALL_ATTENTION_FUNCTIONS = None
+
+
+def _force_set_attn_impl(cfg, value: str = "turbo") -> None:
+    """Set _attn_implementation, bypassing the validator if it rejects unknown names."""
+    try:
+        cfg._attn_implementation = value
+    except Exception:
+        cfg.__dict__["_attn_implementation"] = value
+
+
+def install_turbo_attention(model: nn.Module, cache: TurboQuantKVCache) -> int:
+    """Switch the model's attention dispatcher to 'turbo' and attach the cache to every
+    attention module.
+
+    Works on any HF model whose attention forward dispatches through
+    ALL_ATTENTION_FUNCTIONS — Llama, Qwen, Mistral, Gemma, modern GPT-2, etc.
+    Returns the number of attention modules that received the cache reference.
+    """
+    if ALL_ATTENTION_FUNCTIONS is None:
+        raise RuntimeError("transformers is required for install_turbo_attention")
+
+    if hasattr(model, "config"):
+        _force_set_attn_impl(model.config)
+
+    n = 0
+    for module in model.modules():
+        if hasattr(module, "config") and module is not model:
+            _force_set_attn_impl(module.config)
+        if hasattr(module, "layer_idx") and isinstance(module.layer_idx, int):
+            module._turbo_cache = cache
+            n += 1
+    return n
