@@ -77,18 +77,23 @@ attention module via `module.layer_idx`. No model-class-specific wrappers.
 
 ## K vs V budget — rule of thumb
 
-From `turbo_attn_demo.ipynb`'s sweep on gpt2 at fixed `k_bits=4`:
+The `turbo_attn_function` hooks attention so the just-arrived K/V contribute *exactly*
+to this step's output and only get quantized when stored for future steps. So a
+single-shot prefill is bit-exact to fp; quantization only shows up on tokens that
+attend against the cached prefix. Sweep below is on gpt2 with the demo notebook's
+prefill + decode split (48 prefill / 13 decode tokens, decode-row metrics):
 
-| `v_bits` | compression | top-1 agreement |
-|---|---|---|
-| 4 | 3.37x | 91.8% |
-| 2 | 4.27x | 91.8% |
-| 1 | 4.92x | 88.5% |
+| `v_bits` | compression | top-1 agreement | cos sim |
+|---|---|---|---|
+| 4 | 3.37x | 100% | 1.000 |
+| 3 | 3.76x | 100% | 1.000 |
+| 2 | 4.27x | 100% | 0.956 |
+| 1 | 4.92x | 100% | 0.956 |
 
-Cosine similarity drops faster than top-1 because V quantization adds zero-mean
-noise to the attention output — that scales logit *magnitudes* but doesn't shift
-their *ranking*. Top-1 is the right metric.
+V quantization adds zero-mean noise to the attention output — scales logit
+*magnitudes* but doesn't shift their *ranking*. Top-1 is the right metric, and
+it stays at 100% across the whole V sweep.
 
 QK-norm models (Qwen3, OLMo-2, …) need a higher K budget because QK-norm sharpens
 the softmax, which amplifies any K-side IP estimation noise. `k_bits=6, v_bits=2`
-gets Qwen3-0.6B to ~92% top-1 at 2.5× compression.
+is the recommended starting point for Qwen3-class models.

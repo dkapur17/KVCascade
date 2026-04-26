@@ -241,37 +241,70 @@ class TurboQuantKVCache:
         )
 
     def attention(self, layer_idx: int, q: torch.Tensor,
+                  k_new: torch.Tensor | None = None,
+                  v_new: torch.Tensor | None = None,
                   scaling: float | None = None,
                   attn_mask: torch.Tensor | None = None,
                   causal: bool = True) -> torch.Tensor:
-        """q: [B, H_q, Q, D] -> [B, H_q, Q, D].
+        """q: [B, H_q, T_q, D] -> [B, H_q, T_q, D].
+
+        If `k_new` / `v_new` are provided (shapes `[B, H_kv, T_new, D]`), they are used
+        EXACTLY (no quantization round-trip) for this step's attention, concatenated with
+        the quantized cache prefix. Caller must call `update(layer_idx, k_new, v_new)`
+        afterwards to persist them. This makes prefill bit-exact to fp attention and
+        keeps the just-arrived decode token from taking an unnecessary quantization hit.
+
+        If `k_new` / `v_new` are None, attention runs against the current cache state only.
 
         scaling   : if None, defaults to 1/sqrt(head_dim).
-        attn_mask : additive mask broadcastable to [B, H, Q, T]. If provided,
+        attn_mask : additive mask broadcastable to [B, H, T_q, T_total]. If provided,
                     `causal` is ignored (mask is assumed to already encode causality).
         """
-        T = self.cur_len[layer_idx]
+        T_prefix = self.cur_len[layer_idx]
+        T_new = 0 if k_new is None else k_new.shape[-2]
+        T_total = T_prefix + T_new
         D = self.head_dim
         if scaling is None:
             scaling = 1.0 / math.sqrt(D)
 
-        kq_view = self._key_view(layer_idx, T)
-        scores = self.k_quantizers[layer_idx].estimate_ip_pairwise(kq_view, q) * scaling
+        # ----- scores -----
+        score_chunks: list[torch.Tensor] = []
+        if T_prefix > 0:
+            kq_view = self._key_view(layer_idx, T_prefix)
+            score_chunks.append(
+                self.k_quantizers[layer_idx].estimate_ip_pairwise(kq_view, q) * scaling
+            )
+        if T_new > 0:
+            k_new_q = _repeat_head(k_new, self.n_rep) if self.n_rep > 1 else k_new
+            score_chunks.append((q @ k_new_q.transpose(-1, -2)) * scaling)
+        scores = torch.cat(score_chunks, dim=-1) if len(score_chunks) > 1 else score_chunks[0]
 
         if attn_mask is not None:
             scores = scores + attn_mask[..., :scores.shape[-1]]
         elif causal:
             Qn = q.shape[-2]
-            base = T - Qn
-            i = torch.arange(Qn, device=q.device).unsqueeze(1)
-            j = torch.arange(T,  device=q.device).unsqueeze(0)
+            base = T_total - Qn
+            i = torch.arange(Qn,      device=q.device).unsqueeze(1)
+            j = torch.arange(T_total, device=q.device).unsqueeze(0)
             scores = scores.masked_fill(j > (base + i), float("-inf"))
 
         attn = F.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-        v_idx = unpack_bits(self.v_idx_packed[layer_idx, :, :, :T], self.v_bits, D)
-        V = self.v_quantizers[layer_idx].decode(self.v_norm[layer_idx, :, :, :T], v_idx)  # [B, H_kv, T, D]
-        if self.n_rep > 1:
-            V = _repeat_head(V, self.n_rep)
+
+        # ----- values -----
+        v_chunks: list[torch.Tensor] = []
+        if T_prefix > 0:
+            v_idx = unpack_bits(self.v_idx_packed[layer_idx, :, :, :T_prefix], self.v_bits, D)
+            V_prefix = self.v_quantizers[layer_idx].decode(
+                self.v_norm[layer_idx, :, :, :T_prefix], v_idx
+            )                                                       # [B, H_kv, T_prefix, D]
+            if self.n_rep > 1:
+                V_prefix = _repeat_head(V_prefix, self.n_rep)
+            v_chunks.append(V_prefix)
+        if T_new > 0:
+            v_new_q = _repeat_head(v_new, self.n_rep) if self.n_rep > 1 else v_new
+            v_chunks.append(v_new_q)
+        V = torch.cat(v_chunks, dim=-2) if len(v_chunks) > 1 else v_chunks[0]
+
         return attn @ V
 
 
@@ -289,15 +322,30 @@ def turbo_attn_function(module, query, key, value, attention_mask=None,
         value : [B, H_kv, T_k, D]
     Returns: (attn_output [B, T_q, H_q, D], None)  per HF contract.
 
-    K and V are stored at kv-head granularity (preserving GQA savings); the cache
-    expands to query-head count internally during attention.
+    Attention this step is computed against (quantized prefix) ⊕ (fresh full-precision
+    K/V), so the just-arrived tokens contribute exactly. The fresh K/V are then quantized
+    and stored for future decode steps. Prefill (T_prefix == 0) is bit-exact to fp attention.
     """
     cache: TurboQuantKVCache = module._turbo_cache
     layer_idx: int = module.layer_idx
 
-    cache.update(layer_idx, key, value)
-    out = cache.attention(layer_idx, query,
+    # When we have a quantized prefix but HF only built the mask for the new tokens
+    # (no past_key_values were passed), pad with zeros (prefix is all visible).
+    if attention_mask is not None:
+        T_prefix = cache.cur_len[layer_idx]
+        T_new = key.shape[-2]
+        T_total = T_prefix + T_new
+        if attention_mask.shape[-1] < T_total:
+            pad_len = T_total - attention_mask.shape[-1]
+            pad_shape = list(attention_mask.shape)
+            pad_shape[-1] = pad_len
+            prefix_pad = torch.zeros(pad_shape, device=attention_mask.device,
+                                     dtype=attention_mask.dtype)
+            attention_mask = torch.cat([prefix_pad, attention_mask], dim=-1)
+
+    out = cache.attention(layer_idx, query, k_new=key, v_new=value,
                           scaling=scaling, attn_mask=attention_mask)
+    cache.update(layer_idx, key, value)
 
     # HF expects [B, T, H, D] from an attn_fn (the caller does the final reshape + o_proj).
     out = out.transpose(1, 2).contiguous()
