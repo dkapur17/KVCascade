@@ -25,6 +25,10 @@ def pack_bits(x: torch.Tensor, bits: int) -> torch.Tensor:
     if bits == 8:
         return x.to(torch.uint8)
     *prefix, N = x.shape
+    n_bytes = (N * bits + 7) // 8
+    if x.numel() == 0:
+        # 0-element input (e.g. some prefix dim is 0 — empty tier buffers).
+        return torch.zeros(*prefix, n_bytes, dtype=torch.uint8, device=x.device)
     x = x.long()
     bit_idx = torch.arange(bits, device=x.device, dtype=torch.long)
     bits_t = (x.unsqueeze(-1) >> bit_idx) & 1                           # [..., N, bits]
@@ -32,7 +36,8 @@ def pack_bits(x: torch.Tensor, bits: int) -> torch.Tensor:
     pad = (-flat.shape[-1]) % 8
     if pad:
         flat = F.pad(flat, (0, pad))
-    flat = flat.reshape(*prefix, -1, 8)
+    # Explicit n_bytes avoids the `-1` ambiguity when total elements is 0.
+    flat = flat.reshape(*prefix, n_bytes, 8)
     weights = 1 << torch.arange(8, device=x.device, dtype=torch.long)
     return (flat * weights).sum(dim=-1).to(torch.uint8)
 
