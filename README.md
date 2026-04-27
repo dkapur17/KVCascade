@@ -75,25 +75,84 @@ stays apples-to-apples on grouped-query models.
 flips `model.config._attn_implementation` to `"turbo"` and stamps the cache onto every
 attention module via `module.layer_idx`. No model-class-specific wrappers.
 
-## K vs V budget — rule of thumb
+## K vs V budget — sweep across architectures
 
-The `turbo_attn_function` hooks attention so the just-arrived K/V contribute *exactly*
-to this step's output and only get quantized when stored for future steps. So a
-single-shot prefill is bit-exact to fp; quantization only shows up on tokens that
-attend against the cached prefix. Sweep below is on gpt2 with the demo notebook's
-prefill + decode split (48 prefill / 13 decode tokens, decode-row metrics):
+The hybrid attention path makes prefill bit-exact to fp (just-arrived K/V contribute
+*exactly* this step; only the cached prefix goes through the IP estimator). So
+quantization quality only shows up on tokens that attend against the cached prefix.
 
-| `v_bits` | compression | top-1 agreement | cos sim |
+The tables below run an 80/20 prefill→decode split on a 223-token prompt and compare
+the decode-row logits against an fp single-shot reference. K-budget grid: `{3, 4, 5, 6}`,
+V-budget grid: `{1, 2, 4}`. **Bold** rows are the recommended config per model.
+
+### gpt2 — 12 layers, MHA, learned positional
+
+| k_bits | v_bits | compression | cos sim | top-1 |
+|---|---|---|---|---|
+| 3 | 1 | 5.82× | 0.771 | 97.8% |
+| 3 | 2 | 4.92× | 0.911 | 100.0% |
+| 3 | 4 | 3.76× | 0.911 | 100.0% |
+| 4 | 1 | 4.92× | 0.731 |  95.6% |
+| **4** | **2** | **4.27×** | **0.911** | **100.0%** |
+| 4 | 4 | 3.37× | 1.000 | 100.0% |
+| 5 | 1 | 4.27× | 0.832 | 100.0% |
+| 5 | 2 | 3.76× | 1.000 | 100.0% |
+| 5 | 4 | 3.05× | 1.000 | 100.0% |
+| 6 | 1 | 3.76× | 0.910 | 100.0% |
+| 6 | 2 | 3.37× | 1.000 | 100.0% |
+| 6 | 4 | 2.78× | 1.000 | 100.0% |
+
+### SmolLM2-135M — 30 layers, RoPE, GQA (9 q-heads → 3 kv-heads)
+
+| k_bits | v_bits | compression | cos sim | top-1 |
+|---|---|---|---|---|
+| 3 | 1 | 5.82× | 0.517 |  91.1% |
+| 3 | 2 | 4.92× | 0.851 |  95.6% |
+| 3 | 4 | 3.76× | 0.852 |  95.6% |
+| 4 | 1 | 4.92× | 0.552 |  95.6% |
+| **4** | **2** | **4.27×** | **0.860** | **100.0%** |
+| 4 | 4 | 3.37× | 0.942 | 100.0% |
+| 5 | 1 | 4.27× | 0.579 |  95.6% |
+| 5 | 2 | 3.76× | 0.946 | 100.0% |
+| 5 | 4 | 3.05× | 0.980 | 100.0% |
+| 6 | 1 | 3.76× | 0.554 |  95.6% |
+| 6 | 2 | 3.37× | 0.950 | 100.0% |
+| 6 | 4 | 2.78× | 0.991 | 100.0% |
+
+### Qwen3-0.6B — 28 layers, RoPE + QK-norm, GQA (16 q-heads → 8 kv-heads)
+
+| k_bits | v_bits | compression | cos sim | top-1 |
+|---|---|---|---|---|
+| 3 | 1 | 6.74× | 0.561 |   8.9% |
+| 3 | 2 | 5.57× | 0.636 |   8.9% |
+| 3 | 4 | 4.13× | 0.693 |   6.7% |
+| 4 | 1 | 5.57× | 0.520 |  26.7% |
+| 4 | 2 | 4.74× | 0.620 |  13.3% |
+| 4 | 4 | 3.66× | 0.704 |  22.2% |
+| 5 | 1 | 4.74× | 0.679 |  88.9% |
+| 5 | 2 | 4.13× | 0.783 |  88.9% |
+| 5 | 4 | 3.28× | 0.838 |  91.1% |
+| 6 | 1 | 4.13× | 0.801 |  95.6% |
+| **6** | **2** | **3.66×** | **0.888** | **100.0%** |
+| 6 | 4 | 2.98× | 0.923 | 100.0% |
+
+### Recommended configurations
+
+| model | `(k_bits, v_bits)` | compression | top-1 |
 |---|---|---|---|
-| 4 | 3.37x | 100% | 1.000 |
-| 3 | 3.76x | 100% | 1.000 |
-| 2 | 4.27x | 100% | 0.956 |
-| 1 | 4.92x | 100% | 0.956 |
+| gpt2 | (4, 2) | 4.27× | 100% |
+| SmolLM2-135M | (4, 2) | 4.27× | 100% |
+| Qwen3-0.6B | (6, 2) | 3.66× | 100% |
 
-V quantization adds zero-mean noise to the attention output — scales logit
-*magnitudes* but doesn't shift their *ranking*. Top-1 is the right metric, and
-it stays at 100% across the whole V sweep.
+Two takeaways:
 
-QK-norm models (Qwen3, OLMo-2, …) need a higher K budget because QK-norm sharpens
-the softmax, which amplifies any K-side IP estimation noise. `k_bits=6, v_bits=2`
-is the recommended starting point for Qwen3-class models.
+1. **`v_bits=2` is the sweet spot across all three architectures.** `v_bits=1` tanks
+   cos sim consistently (1-bit V is just sign quantization — too lossy even after
+   averaging). `v_bits=4` is wasted budget. The asymmetric-K/V intuition holds
+   across vanilla, RoPE, and QK-norm.
+
+2. **K budget scales with attention sharpness.** Vanilla and RoPE-only models work
+   at `k_bits=4`. QK-norm sharpens the softmax (K coordinates have unit RMS, so
+   scaled scores are larger), which amplifies K-side IP noise through the softmax
+   non-linearity. The cliff between `k=4` and `k=5` on Qwen3 is striking: top-1
+   jumps from 13% to 88% with one extra bit on K.
