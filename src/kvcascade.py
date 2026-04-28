@@ -145,10 +145,14 @@ class TurboBuffer:
 
     # --- Vectorized score / V access for the hot path ---
 
-    def score_pairwise(self, layer_idx: int, q: torch.Tensor) -> torch.Tensor:
-        """Vectorized IP estimation against this tier's stored keys.
-        q: [B, H_q, T_q, D]; returns [B, H_q, T_q, C].
-        Invalid slots get 0 score (caller masks separately)."""
+    def score_pairwise(self, layer_idx: int, q_grouped: torch.Tensor) -> torch.Tensor:
+        """Vectorized IP estimation at H_kv granularity (grouped-matmul-friendly).
+
+        q_grouped: [B, H_kv, n_rep * T_q, D] — caller has already reshaped from
+        [B, H_q, T_q, D] via .view so the matmul stays at kv-head granularity, avoiding
+        the H_q-expansion that _repeat_head would materialize over storage tensors.
+        Returns: [B, H_kv, n_rep * T_q, C]. Caller reshapes back to [B, H_q, T_q, C].
+        """
         D = self.head_dim
         k_idx = unpack_bits(self.k_idx_packed[layer_idx], self._k_idx_bits, D)        # [B, H_kv, C, D]
         sign01 = unpack_bits(self.k_ressign_packed[layer_idx], 1, self.m)             # [B, H_kv, C, m]
@@ -156,18 +160,9 @@ class TurboBuffer:
         x_norm   = self.k_norm[layer_idx]                                              # [B, H_kv, C]
         res_norm = self.k_resnorm[layer_idx]                                           # [B, H_kv, C]
 
-        H_kv = x_norm.shape[1]
-        H_q = q.shape[1]
-        n_rep = H_q // H_kv
-        if n_rep > 1:
-            x_norm   = _repeat_head(x_norm,   n_rep)
-            k_idx    = _repeat_head(k_idx,    n_rep)
-            res_norm = _repeat_head(res_norm, n_rep)
-            signs    = _repeat_head(signs,    n_rep)
-
         kq = QuantizedKV(x_norm=x_norm, x_indices=k_idx,
                          res_norm=res_norm, res_signs=signs)
-        return self.k_quantizers[layer_idx].estimate_ip_pairwise(kq, q)
+        return self.k_quantizers[layer_idx].estimate_ip_pairwise(kq, q_grouped)
 
     def values(self, layer_idx: int, dtype: torch.dtype) -> torch.Tensor:
         """Vectorized V dequantization. Returns [B, H_kv, C, D] in `dtype`."""
@@ -302,13 +297,16 @@ class KVCascadeCache:
 
         Tokens that lose at every tier are evicted from the cache entirely.
         """
+        last_tier_idx = len(self._tier_chain) - 1
         for tier_idx, tier in enumerate(self._tier_chain):
             is_quant = self._tier_is_quantized[tier_idx]
+            is_last = tier_idx == last_tier_idx
             # G=1 fast path (decode hot path): skip topk pool / full dequantize_all,
             # just compare against the tier's lowest-scored slot per (B, H_kv).
             if cand_score.shape[-1] == 1:
                 cand_K, cand_V, cand_pos, cand_score = self._compete_at_tier_g1(
-                    tier, layer_idx, cand_K, cand_V, cand_pos, cand_score, is_quant
+                    tier, layer_idx, cand_K, cand_V, cand_pos, cand_score, is_quant,
+                    is_last=is_last,
                 )
             else:
                 cand_K, cand_V, cand_pos, cand_score = self._compete_at_tier(
@@ -444,7 +442,7 @@ class KVCascadeCache:
     def _compete_at_tier_g1(self, tier, layer_idx: int,
                              cand_K: torch.Tensor, cand_V: torch.Tensor,
                              cand_pos: torch.Tensor, cand_score: torch.Tensor,
-                             is_quantized: bool):
+                             is_quantized: bool, is_last: bool = False):
         """Single-candidate (G=1) fast path equivalent to ``_compete_at_tier``.
 
         Per (B, H_kv): find the tier's lowest-scored slot. If the candidate beats it,
@@ -453,6 +451,11 @@ class KVCascadeCache:
         unchanged. Avoids the topk pool, scatter sentinel pairing, and (for quantized
         tiers) the full ``dequantize_all`` — only one slot is unpacked / decoded /
         encoded per (B, H_kv).
+
+        When ``is_last`` is True (this tier is the chain tail), the evicted slot's fp
+        K/V is never consumed by a downstream tier, so for quantized tiers we skip the
+        unpack + decode_rotated + R matmul + V decode for that slot. Returned next-stream
+        scores are forced to -inf so the cascade loop's early-exit terminates.
         """
         B = self.batch_size
         H_kv = self.num_kv_heads
@@ -504,14 +507,24 @@ class KVCascadeCache:
             k_resnorm_at_min = tier.k_resnorm[layer_idx].gather(-1, idx_3d)
             v_norm_at_min    = tier.v_norm[layer_idx].gather(-1, idx_3d)
 
-            # Reconstruct the one slot's K/V to fp (skip JL signs — only used for IP estimation,
-            # not reconstruction).
-            k_idx_at_min = unpack_bits(k_idx_packed_at_min, tier._k_idx_bits, D)   # [B, H_kv, 1, D]
-            v_idx_at_min = unpack_bits(v_idx_packed_at_min, tier._v_idx_bits, D)
-            R = tier.k_quantizers[layer_idx].R
-            u_hat_at_min = tier.k_quantizers[layer_idx].mse_quantizer.decode_rotated(k_idx_at_min)
-            evicted_K = k_norm_at_min.unsqueeze(-1) * (u_hat_at_min @ R)           # [B, H_kv, 1, D]
-            evicted_V = tier.v_quantizers[layer_idx].decode(v_norm_at_min, v_idx_at_min)
+            if is_last:
+                # No downstream tier will consume the evicted slot's fp values — skip the
+                # unpack + decode_rotated + R matmul + V decode entirely. evicted_K/V
+                # become unused placeholders; we still need their shapes for the
+                # `where(swap, cand, evicted)` install path on fp tiers, but for quantized
+                # tiers the install only writes packed fields, so we can skip the fp
+                # reconstruction outright. Use cand_K/V as same-shape placeholders.
+                evicted_K = cand_K
+                evicted_V = cand_V
+            else:
+                # Reconstruct the one slot's K/V to fp (skip JL signs — only used for IP
+                # estimation, not reconstruction).
+                k_idx_at_min = unpack_bits(k_idx_packed_at_min, tier._k_idx_bits, D)   # [B, H_kv, 1, D]
+                v_idx_at_min = unpack_bits(v_idx_packed_at_min, tier._v_idx_bits, D)
+                R = tier.k_quantizers[layer_idx].R
+                u_hat_at_min = tier.k_quantizers[layer_idx].mse_quantizer.decode_rotated(k_idx_at_min)
+                evicted_K = k_norm_at_min.unsqueeze(-1) * (u_hat_at_min @ R)           # [B, H_kv, 1, D]
+                evicted_V = tier.v_quantizers[layer_idx].decode(v_norm_at_min, v_idx_at_min)
         else:
             evicted_K = tier.K[layer_idx].gather(2, idx_4d_D)                      # [B, H_kv, 1, D]
             evicted_V = tier.V[layer_idx].gather(2, idx_4d_D)
@@ -559,6 +572,11 @@ class KVCascadeCache:
             tier.V[layer_idx].scatter_(2, idx_4d_D, new_V_at_min)
 
         # ---- 5. Build next-tier candidate stream. ----
+        if is_last:
+            # No downstream consumer; just emit -inf scores so the cascade loop terminates
+            # via its all-(-inf) early-exit. K/V/pos are not used by any subsequent tier.
+            return cand_K, cand_V, cand_pos, torch.full_like(cand_score, _NEG_INF)
+
         # Swap-and-valid: propagate the displaced resident downward.
         # No swap: propagate the original candidate.
         # Swap-and-invalid (filled an empty slot): no real eviction; mark score = -inf so it dies.
@@ -836,40 +854,57 @@ class KVCascadeCache:
             scores [B, H_q, T_q, Ctot]
             pos    [B, H_q, Ctot]
             valid  [B, H_q, Ctot] bool
+
+        K stays at H_kv granularity throughout. The query is reshaped to
+        [B, H_kv, n_rep * T_q, D] for grouped matmul — no H_q-expansion of K via
+        _repeat_head. All FP buffers (ring + fp_tier) are concatenated along the slot
+        axis and scored in a single matmul to amortize kernel-launch overhead.
+        Buffer order in the concat matches `self._all_buffers` so the score-update
+        loop's offset slicing remains correct.
         """
+        B, H_q, T_q, D = q.shape
+        H_kv = self.num_kv_heads
         n_rep = self.n_rep
         q_dtype = q.dtype
 
-        score_chunks: list[torch.Tensor] = []
-        pos_chunks:   list[torch.Tensor] = []
-        valid_chunks: list[torch.Tensor] = []
+        # `reshape` instead of `view` — q may not be contiguous when invoked from the
+        # HF dispatcher path (e.g., comes from a transpose of [B, T_q, H_q, D]).
+        # `reshape` falls back to a copy iff the layout requires it.
+        q_grouped = q.reshape(B, H_kv, n_rep * T_q, D) if n_rep > 1 else q
 
-        # Helper: fp tier scoring with proper dtype handling.
-        def _fp_score(K: torch.Tensor) -> torch.Tensor:
-            K_q = K.to(q_dtype)
-            if n_rep > 1:
-                K_q = _repeat_head(K_q, n_rep)
-            return q @ K_q.transpose(-1, -2)                                       # [B, H_q, T_q, C]
+        score_chunks_grouped: list[torch.Tensor] = []   # each [B, H_kv, n_rep*T_q, C_buf]
+        pos_chunks_kv:        list[torch.Tensor] = []   # each [B, H_kv, C_buf]
 
-        def _expand_meta(pos: torch.Tensor):
-            valid = pos >= 0
-            if n_rep > 1:
-                pos = _repeat_head(pos, n_rep)
-                valid = _repeat_head(valid, n_rep)
-            return pos, valid
-
-        # Walk all buffers in declaration order: ring, fp_tier, *quant_tiers.
+        # Pass 1: collect FP buffer K (in declaration order) and fuse into one matmul.
+        fp_K_chunks: list[torch.Tensor] = []
         for buf in self._all_buffers:
             if isinstance(buf, FpBuffer):
-                score_chunks.append(_fp_score(buf.K[layer_idx]))
-            else:  # TurboBuffer
-                score_chunks.append(buf.score_pairwise(layer_idx, q).to(q_dtype))
-            p, v = _expand_meta(buf.pos[layer_idx])
-            pos_chunks.append(p); valid_chunks.append(v)
+                fp_K_chunks.append(buf.K[layer_idx].to(q_dtype))
+                pos_chunks_kv.append(buf.pos[layer_idx])
+        if fp_K_chunks:
+            fp_K_concat = torch.cat(fp_K_chunks, dim=2) if len(fp_K_chunks) > 1 else fp_K_chunks[0]
+            score_chunks_grouped.append(q_grouped @ fp_K_concat.transpose(-1, -2))
 
-        scores    = torch.cat(score_chunks, dim=-1)                                # [B, H_q, T_q, Ctot]
-        positions = torch.cat(pos_chunks,   dim=-1)                                # [B, H_q, Ctot]
-        valid     = torch.cat(valid_chunks, dim=-1)
+        # Pass 2: each quant buffer contributes its own matmul (per-tier R/G differ).
+        for buf in self._all_buffers:
+            if not isinstance(buf, FpBuffer):
+                sc = buf.score_pairwise(layer_idx, q_grouped).to(q_dtype)
+                score_chunks_grouped.append(sc)
+                pos_chunks_kv.append(buf.pos[layer_idx])
+
+        scores_grouped_all = torch.cat(score_chunks_grouped, dim=-1)    # [B, H_kv, n_rep*T_q, Ctot]
+        # `reshape` to be safe; the cat output is contiguous so this should be a view.
+        scores = scores_grouped_all.reshape(B, H_q, T_q, -1) if n_rep > 1 else scores_grouped_all
+
+        pos_kv = torch.cat(pos_chunks_kv, dim=-1)                       # [B, H_kv, Ctot]
+        valid_kv = pos_kv >= 0
+        if n_rep > 1:
+            positions = _repeat_head(pos_kv,   n_rep)
+            valid     = _repeat_head(valid_kv, n_rep)
+        else:
+            positions = pos_kv
+            valid     = valid_kv
+
         return scores, positions, valid
 
     def _values(self, layer_idx: int, dtype: torch.dtype) -> torch.Tensor:
