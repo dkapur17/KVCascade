@@ -1,6 +1,6 @@
-# KV-CASCADE
+# KVCascade
 
-**KV-Cache with Adaptive Score-based Compression And Decay-driven Eviction.**
+**KV-C**ache with **A**daptive **S**core-based **C**ompression **A**nd **D**ecay-driven **E**viction.
 
 A memory-bounded KV cache for long-context decoder inference. Tokens flow through a
 hierarchy of precision tiers — the recent and load-bearing
@@ -19,16 +19,17 @@ flowchart TD
     new["new tokens"] --> ring["<b>recency ring</b><br/>fp, FIFO — last-K tokens"]
     ring -->|graduate| fp["<b>fp_tier</b><br/>fp, importance-managed — top-K by score"]
     fp -->|demote| q0["<b>quant_tiers[0]</b><br/>TurboQuant, e.g. k=6/v=2 — bulk storage"]
-    q0 -->|demote| q1["<b>quant_tiers[1]</b><br/>TurboQuant, e.g. k=4/v=1 — optional aggressive tier"]
-    q1 -->|evict| dropped(["evicted"])
+    q0 -->|demote ...| qn["<b>quant_tiers[n]</b><br/>TurboQuant, e.g. k=4/v=1 — increasingly aggressive compression tiers"]
+    qn -->|evict| dropped(["evicted"])
 
     classDef fpStyle fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
     classDef quantStyle fill:#fff3e0,stroke:#ef6c00,color:#e65100
     classDef terminal fill:#f5f5f5,stroke:#616161,color:#212121
     class ring,fp fpStyle
-    class q0,q1 quantStyle
+    class q0,qn quantStyle
     class new,dropped terminal
 ```
+Supports an arbitrary hierarchy of quantized tiers with increasingly aggressive quantization, but findings show that single quantization tier performs the best, since excessive quantization introduces adversarial noise in the inner product estimation - better to evict than to keep.
 
 ## Headline result
 
