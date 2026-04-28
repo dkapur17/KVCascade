@@ -386,10 +386,11 @@ class TieredKVCache:
             cand_indices_chosen = cand_indices_chosen[..., :C]
         # Now both are [B, H_kv, C].
 
-        # ---- 6. Gather candidate data for accepted candidates, in pairing order ----
+        # ---- 6. Gather candidate metadata for accepted candidates, in pairing order ----
+        # K/V are NOT gathered here — they're gathered inside _scatter_install, after
+        # encoding for quantized tiers. That keeps encode_batch's input at G entries
+        # instead of C (with sentinel garbage), which dominates decode-step cascade cost.
         safe_cand = cand_indices_chosen.clamp(max=max(G - 1, 0))                  # for sentinel pairs, this is bogus
-        new_K_open   = cand_K.gather(2, safe_cand.unsqueeze(-1).expand(-1, -1, -1, D))  # [B, H_kv, C, D]
-        new_V_open   = cand_V.gather(2, safe_cand.unsqueeze(-1).expand(-1, -1, -1, D))
         new_pos_open = cand_pos.gather(2, safe_cand)                              # [B, H_kv, C]
         new_score_open = cand_score_f.gather(2, safe_cand)
 
@@ -400,7 +401,7 @@ class TieredKVCache:
         pair_valid = (cand_indices_chosen < G) & (open_slot_indices < C) & (new_score_open > _NEG_INF)
         new_pos_open   = torch.where(pair_valid, new_pos_open,   torch.full_like(new_pos_open, -1))
         new_score_open = torch.where(pair_valid, new_score_open, torch.zeros_like(new_score_open))
-        # For invalid pairs we can leave K/V garbage; the slot pos == -1 masks them in attention.
+        # For invalid pairs the gathered K/V entries are bogus; the slot pos == -1 masks them in attention.
 
         # ---- 7. Build next-tier candidate stream ----
         # Residents that left (~kept & valid): keep their original score for cascading.
@@ -425,25 +426,35 @@ class TieredKVCache:
 
         # ---- 8. Install winners into the tier's storage ----
         self._scatter_install(tier, layer_idx, open_slot_indices,
-                              new_K_open, new_V_open, new_pos_open, new_score_open,
+                              cand_K, cand_V, safe_cand,
+                              new_pos_open, new_score_open,
                               is_quantized)
 
         return next_K, next_V, next_pos, next_score
 
     def _scatter_install(self, tier, layer_idx: int, open_slots: torch.Tensor,
-                         K_new: torch.Tensor, V_new: torch.Tensor,
+                         cand_K: torch.Tensor, cand_V: torch.Tensor,
+                         cand_chosen: torch.Tensor,
                          pos_new: torch.Tensor, score_new: torch.Tensor,
                          is_quantized: bool) -> None:
-        """Write [B, H_kv, C, ...] data into tier slots indexed by `open_slots`.
+        """Install accepted candidates into ``tier``.
 
-        `open_slots` has shape [B, H_kv, C], with values in [0, C]. Values equal to C
-        are sentinels (no-write); they go to a throwaway slot in a (C+1)-extended
-        scratch buffer, which is then sliced off.
+        cand_K, cand_V : [B, H_kv, G, D]  — the parent's candidate batch (un-gathered).
+        cand_chosen    : [B, H_kv, C]     — index into the candidate dim for each open
+                                             slot; sentinels are clamped to a safe value.
+        pos_new        : [B, H_kv, C]     — already gathered; sentinel pairs set to -1.
+        score_new      : [B, H_kv, C]     — already gathered; sentinel pairs set to 0.
+        open_slots     : [B, H_kv, C]     — target slots; sentinel value C lands in
+                                             the (C+1)-extended scratch slot.
+
+        For quantized tiers, ``encode_batch`` runs on the G-sized candidate batch
+        (avoiding the sentinel-padded C-sized waste); the encoded fields are then
+        gathered at ``cand_chosen`` and scattered at ``open_slots`` per field. For fp
+        tiers, K/V are gathered and scattered directly.
         """
         B = self.batch_size
         H_kv = self.num_kv_heads
         C = tier.capacity
-        D = self.head_dim
         device = open_slots.device
 
         def _scatter_3d(field_layer: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
@@ -452,39 +463,124 @@ class TieredKVCache:
             ext.scatter_(2, open_slots, src.to(field_layer.dtype))
             return ext[..., :C]
 
-        def _scatter_4d(field_layer: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
-            extra = src.shape[-1]
+        def _gather_scatter_3d(field_layer: torch.Tensor, src_cand: torch.Tensor) -> torch.Tensor:
+            gathered = src_cand.gather(2, cand_chosen)
+            ext = torch.zeros((B, H_kv, C + 1), dtype=field_layer.dtype, device=device)
+            ext[..., :C] = field_layer
+            ext.scatter_(2, open_slots, gathered.to(field_layer.dtype))
+            return ext[..., :C]
+
+        def _gather_scatter_4d(field_layer: torch.Tensor, src_cand: torch.Tensor) -> torch.Tensor:
+            extra = src_cand.shape[-1]
+            gathered = src_cand.gather(2, cand_chosen.unsqueeze(-1).expand(-1, -1, -1, extra))
             ext = torch.zeros((B, H_kv, C + 1, extra), dtype=field_layer.dtype, device=device)
             ext[..., :C, :] = field_layer
             idx = open_slots.unsqueeze(-1).expand(-1, -1, -1, extra)
-            ext.scatter_(2, idx, src.to(field_layer.dtype))
+            ext.scatter_(2, idx, gathered.to(field_layer.dtype))
             return ext[..., :C, :]
 
-        # pos / score are always 3D.
+        # pos / score were already gathered + sentinel-masked by the caller.
         tier.pos[layer_idx]   = _scatter_3d(tier.pos[layer_idx],   pos_new)
         tier.score[layer_idx] = _scatter_3d(tier.score[layer_idx], score_new)
 
         if is_quantized:
-            # Encode the winners and scatter the encoded fields. Note: we encode all C
-            # winners (including bogus data at sentinel slots); their pos == -1 makes
-            # them invisible to attention regardless.
-            (k_norm_new, k_idx_packed_new, k_resnorm_new,
-             k_ressign_packed_new, v_norm_new, v_idx_packed_new) = tier.encode_batch(
-                layer_idx, K_new, V_new
+            # Encode the G candidates only (no sentinel waste). The encoded fields are
+            # [B, H_kv, G, *]; gather at cand_chosen brings them to [B, H_kv, C, *] for
+            # scatter into the tier's storage.
+            (k_norm_cand, k_idx_packed_cand, k_resnorm_cand,
+             k_ressign_packed_cand, v_norm_cand, v_idx_packed_cand) = tier.encode_batch(
+                layer_idx, cand_K, cand_V
             )
-            tier.k_norm[layer_idx]    = _scatter_3d(tier.k_norm[layer_idx],    k_norm_new)
-            tier.k_resnorm[layer_idx] = _scatter_3d(tier.k_resnorm[layer_idx], k_resnorm_new)
-            tier.v_norm[layer_idx]    = _scatter_3d(tier.v_norm[layer_idx],    v_norm_new)
-            tier.k_idx_packed[layer_idx]     = _scatter_4d(tier.k_idx_packed[layer_idx],     k_idx_packed_new)
-            tier.k_ressign_packed[layer_idx] = _scatter_4d(tier.k_ressign_packed[layer_idx], k_ressign_packed_new)
-            tier.v_idx_packed[layer_idx]     = _scatter_4d(tier.v_idx_packed[layer_idx],     v_idx_packed_new)
+            tier.k_norm[layer_idx]    = _gather_scatter_3d(tier.k_norm[layer_idx],    k_norm_cand)
+            tier.k_resnorm[layer_idx] = _gather_scatter_3d(tier.k_resnorm[layer_idx], k_resnorm_cand)
+            tier.v_norm[layer_idx]    = _gather_scatter_3d(tier.v_norm[layer_idx],    v_norm_cand)
+            tier.k_idx_packed[layer_idx]     = _gather_scatter_4d(tier.k_idx_packed[layer_idx],     k_idx_packed_cand)
+            tier.k_ressign_packed[layer_idx] = _gather_scatter_4d(tier.k_ressign_packed[layer_idx], k_ressign_packed_cand)
+            tier.v_idx_packed[layer_idx]     = _gather_scatter_4d(tier.v_idx_packed[layer_idx],     v_idx_packed_cand)
         else:
-            tier.K[layer_idx] = _scatter_4d(tier.K[layer_idx], K_new)
-            tier.V[layer_idx] = _scatter_4d(tier.V[layer_idx], V_new)
+            tier.K[layer_idx] = _gather_scatter_4d(tier.K[layer_idx], cand_K)
+            tier.V[layer_idx] = _gather_scatter_4d(tier.V[layer_idx], cand_V)
 
     # ======================================================================================
     # Vectorized ring ingestion
     # ======================================================================================
+
+    def _prefill_direct_assign(self, layer_idx: int,
+                                K_new: torch.Tensor, V_new: torch.Tensor,
+                                positions_t: torch.Tensor,
+                                init_scores: torch.Tensor) -> None:
+        """One-shot prefill ingestion when the cache is empty and T_new > R.
+
+        Cascade competition with empty tiers is equivalent to a global rank-by-score
+        and contiguous assignment. So:
+          - Last R tokens fill the recency ring.
+          - The remaining T_new - R tokens are sorted by initial score (per (B, H_kv));
+            top fp_tier.capacity go to fp_tier, next quant_tiers[0].capacity go to
+            quant_tiers[0], and so on. Anything past the last tier is dropped.
+
+        Skips dequantize_all on (zeroed) empty tiers and runs encode_batch on the
+        exact n_take tokens going into each quant tier — no sentinel padding.
+        """
+        B, H_kv, T_new, D = K_new.shape
+        R = self.ring.capacity
+        device = K_new.device
+        cursor = int(self.ring_cursor[layer_idx, 0, 0].item())
+
+        # 1. Last R tokens to the ring. Match the existing overflow path's slot mapping.
+        write_offsets = (cursor + T_new - R + torch.arange(R, device=device)) % R
+        self.ring.K[layer_idx, :, :, write_offsets, :] = K_new[:, :, T_new - R:, :]
+        self.ring.V[layer_idx, :, :, write_offsets, :] = V_new[:, :, T_new - R:, :]
+        self.ring.pos[layer_idx, :, :, write_offsets] = (
+            positions_t[T_new - R:].view(1, 1, R).expand(B, H_kv, R)
+        )
+        self.ring.score[layer_idx, :, :, write_offsets] = init_scores[:, :, T_new - R:]
+
+        # 2. Remaining tokens, ranked by initial score, distributed across tiers.
+        T_rem = T_new - R
+        if T_rem == 0:
+            return
+        rem_K = K_new[:, :, :T_rem, :]                                    # [B, H_kv, T_rem, D]
+        rem_V = V_new[:, :, :T_rem, :]
+        rem_pos = positions_t[:T_rem].view(1, 1, T_rem).expand(B, H_kv, T_rem).contiguous()
+        rem_score = init_scores[:, :, :T_rem]
+
+        sort_idx = rem_score.argsort(dim=-1, descending=True)             # [B, H_kv, T_rem]
+
+        offset = 0
+        for tier_idx, tier in enumerate(self._tier_chain):
+            is_quant = self._tier_is_quantized[tier_idx]
+            C = tier.capacity
+            if C == 0:
+                continue
+            n_avail = T_rem - offset
+            if n_avail <= 0:
+                break
+            n_take = min(C, n_avail)
+
+            idx_slice = sort_idx[:, :, offset:offset + n_take]            # [B, H_kv, n_take]
+            K_t = rem_K.gather(2, idx_slice.unsqueeze(-1).expand(-1, -1, -1, D))
+            V_t = rem_V.gather(2, idx_slice.unsqueeze(-1).expand(-1, -1, -1, D))
+            pos_t = rem_pos.gather(2, idx_slice)
+            score_t = rem_score.gather(2, idx_slice)
+
+            # Tier was empty — pos already -1 / score already 0 in trailing slots.
+            tier.pos[layer_idx, :, :, :n_take] = pos_t
+            tier.score[layer_idx, :, :, :n_take] = score_t.to(tier.score.dtype)
+
+            if is_quant:
+                (k_norm, k_idx_packed, k_resnorm, k_ressign_packed,
+                 v_norm, v_idx_packed) = tier.encode_batch(layer_idx, K_t, V_t)
+                tier.k_norm[layer_idx, :, :, :n_take]            = k_norm
+                tier.k_resnorm[layer_idx, :, :, :n_take]         = k_resnorm
+                tier.k_idx_packed[layer_idx, :, :, :n_take]      = k_idx_packed
+                tier.k_ressign_packed[layer_idx, :, :, :n_take]  = k_ressign_packed
+                tier.v_norm[layer_idx, :, :, :n_take]            = v_norm
+                tier.v_idx_packed[layer_idx, :, :, :n_take]      = v_idx_packed
+            else:
+                tier.K[layer_idx, :, :, :n_take, :] = K_t
+                tier.V[layer_idx, :, :, :n_take, :] = V_t
+
+            offset += n_take
 
     def _ingest_into_ring(self, layer_idx: int,
                           K_new: torch.Tensor, V_new: torch.Tensor,
@@ -510,6 +606,15 @@ class TieredKVCache:
                                        dtype=self.ring.score.dtype)
         else:
             init_scores = initial_scores.to(self.ring.score.dtype)
+
+        # Fast path for the prefill case (cache empty and T_new > R). Cascade competition
+        # is degenerate when all tiers are empty: it just ranks candidates by score and
+        # fills tiers in order. We bypass the per-tier topk / dequantize_all / sentinel-
+        # padded encode_batch and direct-assign instead.
+        if self.next_pos[layer_idx] == 0 and T_new > R:
+            self._prefill_direct_assign(layer_idx, K_new, V_new, positions_t, init_scores)
+            self.ring_cursor[layer_idx].fill_((cursor + T_new) % R)
+            return
 
         if T_new <= R:
             # Each ring slot is written at most once. Graduates are the existing

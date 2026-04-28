@@ -29,17 +29,31 @@ def pack_bits(x: torch.Tensor, bits: int) -> torch.Tensor:
     if x.numel() == 0:
         # 0-element input (e.g. some prefix dim is 0 — empty tier buffers).
         return torch.zeros(*prefix, n_bytes, dtype=torch.uint8, device=x.device)
-    x = x.long()
-    bit_idx = torch.arange(bits, device=x.device, dtype=torch.long)
-    bits_t = (x.unsqueeze(-1) >> bit_idx) & 1                           # [..., N, bits]
+
+    if bits in (1, 2, 4):
+        # Power-of-2 widths align with byte boundaries: n_per_byte values fit directly
+        # into one byte via shift+sum. No per-bit elaboration, no .long() cast.
+        n_per_byte = 8 // bits
+        pad = (-N) % n_per_byte
+        if pad:
+            x = F.pad(x, (0, pad))
+        x_u8 = x.to(torch.uint8).reshape(*prefix, n_bytes, n_per_byte)
+        shifts = torch.arange(0, 8, bits, device=x.device, dtype=torch.uint8)
+        return (x_u8 << shifts).sum(dim=-1, dtype=torch.uint8)
+
+    # General path for non-power-of-2 widths (3, 5, 6, 7). Keep everything in uint8 —
+    # the previous .long() cast 8x'd the intermediate [..., N, bits] tensor, which
+    # dominated bandwidth on the score / cascade hot paths.
+    x_u8 = x.to(torch.uint8)
+    bit_idx = torch.arange(bits, device=x.device, dtype=torch.uint8)
+    bits_t = (x_u8.unsqueeze(-1) >> bit_idx) & 1                        # [..., N, bits] uint8
     flat = bits_t.reshape(*prefix, N * bits)
     pad = (-flat.shape[-1]) % 8
     if pad:
         flat = F.pad(flat, (0, pad))
-    # Explicit n_bytes avoids the `-1` ambiguity when total elements is 0.
     flat = flat.reshape(*prefix, n_bytes, 8)
-    weights = 1 << torch.arange(8, device=x.device, dtype=torch.long)
-    return (flat * weights).sum(dim=-1).to(torch.uint8)
+    weights = (1 << torch.arange(8, device=x.device, dtype=torch.uint8))
+    return (flat * weights).sum(dim=-1, dtype=torch.uint8)
 
 
 def unpack_bits(packed: torch.Tensor, bits: int, N: int) -> torch.Tensor:
@@ -47,12 +61,23 @@ def unpack_bits(packed: torch.Tensor, bits: int, N: int) -> torch.Tensor:
     if bits == 8:
         return packed[..., :N]
     *prefix, n_bytes = packed.shape
-    bit_idx = torch.arange(8, device=packed.device, dtype=torch.long)
-    flat = (packed.long().unsqueeze(-1) >> bit_idx) & 1                 # [..., n_bytes, 8]
+
+    if bits in (1, 2, 4):
+        # Power-of-2 widths: each byte holds n_per_byte values; one shift + mask per
+        # output position, no per-bit reassembly.
+        n_per_byte = 8 // bits
+        mask = (1 << bits) - 1
+        shifts = torch.arange(0, 8, bits, device=packed.device, dtype=torch.uint8)
+        out = (packed.unsqueeze(-1) >> shifts) & mask                   # [..., n_bytes, n_per_byte] uint8
+        return out.reshape(*prefix, n_bytes * n_per_byte)[..., :N]
+
+    # General path: same algorithm as before but in uint8 instead of int64.
+    bit_idx = torch.arange(8, device=packed.device, dtype=torch.uint8)
+    flat = (packed.unsqueeze(-1) >> bit_idx) & 1                        # [..., n_bytes, 8] uint8
     flat = flat.reshape(*prefix, n_bytes * 8)[..., : N * bits]
     flat = flat.reshape(*prefix, N, bits)
-    weights = 1 << torch.arange(bits, device=packed.device, dtype=torch.long)
-    return (flat * weights).sum(dim=-1).to(torch.uint8)
+    weights = (1 << torch.arange(bits, device=packed.device, dtype=torch.uint8))
+    return (flat * weights).sum(dim=-1, dtype=torch.uint8)
 
 
 # --------------------------------------------------------------------------------------
