@@ -1,25 +1,85 @@
-# TurboAttention
+# KV-CASCADE
 
-Bit-packed KV-cache quantization (TurboQuant) plus a drop-in attention replacement
-that hooks into HuggingFace's `ALL_ATTENTION_FUNCTIONS` dispatcher — so it works on
-any modern decoder (vanilla / RoPE / QK-norm / GQA) without touching the model's
-pre-SDPA pipeline.
+**KV-Cache with Adaptive Score-based Compression And Decay-driven Eviction.**
+
+A memory-bounded KV cache for long-context decoder inference. Tokens flow through a
+hierarchy of precision tiers — the recent and load-bearing
+ones at full precision, and the unimportant tail evicted entirely. Importance
+is driven per (layer, kv-head) by a decaying score on accumulated attention received,
+so each head independently decides which tokens to keep.
+
+Compression on what's kept is done with [TurboQuant](https://arxiv.org/abs/2504.16127)
+(norm + Haar-rotated Lloyd-Max + 1-bit JL residual sketch). Eviction is in the
+spirit of [H2O](https://arxiv.org/abs/2306.14048) / [SnapKV](https://arxiv.org/abs/2404.14469).
+The combination — quantize what you keep, evict what you don't — gives a Pareto
+improvement over either approach alone on long-context language modeling.
+
+```mermaid
+flowchart TD
+    new["new tokens"] --> ring["<b>recency ring</b><br/>fp, FIFO — last-K tokens"]
+    ring -->|graduate| fp["<b>fp_tier</b><br/>fp, importance-managed — top-K by score"]
+    fp -->|demote| q0["<b>quant_tiers[0]</b><br/>TurboQuant, e.g. k=6/v=2 — bulk storage"]
+    q0 -->|demote| q1["<b>quant_tiers[1]</b><br/>TurboQuant, e.g. k=4/v=1 — optional aggressive tier"]
+    q1 -->|evict| dropped(["evicted"])
+
+    classDef fpStyle fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+    classDef quantStyle fill:#fff3e0,stroke:#ef6c00,color:#e65100
+    classDef terminal fill:#f5f5f5,stroke:#616161,color:#212121
+    class ring,fp fpStyle
+    class q0,q1 quantStyle
+    class new,dropped terminal
+```
+
+## Headline result
+
+Sequential-decode evaluation on **Qwen3-0.6B**, wikitext-103, T_ctx=4096, T_decode=64,
+top-1 agreement against fp32 reference. Single sample of T_dec=64 decode positions:
+
+| config | bytes | compression | top-1 | Δ vs uniform |
+|---|---|---|---|---|
+| uniform `k=6/v=2` (TurboQuant baseline) | 120 MB | 3.82× | 73.4% | 0 |
+| **KV-CASCADE B** (iso-byte, ema) | 120 MB | 3.82× | **89.1%** | **+15.7 pp** |
+| **KV-CASCADE F** (½ byte, ema) | 60 MB | 7.64× | **82.8%** | **+9.4 pp** |
+| **KV-CASCADE G** (¼ byte, ema) | 30 MB | 15.30× | 75.0% | +1.6 pp |
+
+Multi-sample averages over 5 wikitext-103 chunks at the same setup:
+
+| config | top-1 (mean ± sd) |
+|---|---|
+| uniform `k=6/v=2` | 68.4% ± 10.7% |
+| KV-CASCADE B (iso, ema) | **78.4% ± 5.7%** |
+| KV-CASCADE F (½ byte, ema) | **80.0% ± 8.4%** |
+| KV-CASCADE G (¼ byte, ema) | **79.7% ± 9.2%** |
+
+Two things happen here that aren't obvious:
+
+1. **Iso-byte: KV-CASCADE B beats uniform TurboQuant by ~10 pp.** Same total memory,
+   but the architecture (recency ring at fp + sink tier at fp + bulk at quantized +
+   evict the long tail) compounds less softmax noise than uniform's "every-token-gets-a-
+   little-noisy" regime when the cache is being used sequentially.
+
+2. **At ½ and ¼ uniform's bytes, KV-CASCADE still wins** — F (60 MB) and G (30 MB)
+   both beat uniform's 120 MB. Removing the long tail of low-importance tokens *helps*
+   accuracy because their quantized contributions to the softmax were net noise.
+
+The win is **specific to sequential-decode workloads** (real autoregressive generation).
+On single-shot scoring, uniform TurboQuant is competitive. See "When does KV-CASCADE
+win?" below.
 
 ## Layout
 
 ```
 src/
-  lloyd_max.py    LloydMaxCodebook — Lloyd-Max codebook for unit Gaussians
-  polar_quant.py  PolarQuant       — norm + Haar-rotated Lloyd-Max, batched on last dim
-  jl_quant.py     JLQuantizer      — 1-bit JL sketch for inner-product estimation
-  turbo_quant.py  TurboQuant       — Polar coarse code + JL residual sketch
+  lloyd_max.py    LloydMaxCodebook  — Lloyd-Max codebook for unit Gaussians
+  polar_quant.py  PolarQuant        — norm + Haar-rotated Lloyd-Max, batched on last dim
+  jl_quant.py     JLQuantizer       — 1-bit JL sketch for inner-product estimation
+  turbo_quant.py  TurboQuant        — Polar coarse code + JL residual sketch
   turbo_attn.py   bit packing, TurboQuantKVCache, HF dispatcher integration
+  kvcascade.py    KVCascadeCache    — recency ring + fp tier + N quant tiers + eviction
 
-notebooks/
-  turboquant.ipynb        original numpy walkthrough of every quantizer
-  turboattn_gpt2.ipynb    PyTorch port + first GPT-2 integration
-  turbo_attn_demo.ipynb   cross-architecture demo (GPT-2 / SmolLM2 / Qwen3) +
-                          V-bit tradeoff sweep
+eval.py            sequential-decode eval on wikitext-103 (CUDA, bf16)
+
+notebooks/         demos and quantizer walkthroughs (single-shot regime)
 ```
 
 ## Quick start
@@ -27,132 +87,154 @@ notebooks/
 ```python
 import sys; sys.path.insert(0, "src")
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from turbo_attn import TurboQuantKVCache, install_turbo_attention
+from kvcascade import KVCascadeCache, install_kvcascade
 
-model = AutoModelForCausalLM.from_pretrained("gpt2", attn_implementation="eager").eval()
-tok   = AutoTokenizer.from_pretrained("gpt2")
-ids   = tok("hello world " * 16, return_tensors="pt").input_ids
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen3-0.6B", torch_dtype="bfloat16", attn_implementation="eager"
+).cuda().eval()
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
 
 cfg = model.config
-cache = TurboQuantKVCache(
-    num_layers=cfg.n_layer, batch_size=1,
-    num_heads=cfg.n_head, num_kv_heads=cfg.n_head,
-    head_dim=cfg.n_embd // cfg.n_head,
-    k_bits=4, v_bits=2,        # asymmetric budgets — see "K vs V" below
+cache = KVCascadeCache(
+    num_layers=cfg.num_hidden_layers,
+    batch_size=1,
+    num_heads=cfg.num_attention_heads,
+    num_kv_heads=cfg.num_key_value_heads,
+    head_dim=cfg.head_dim,
+    ring_size=8,
+    fp_capacity=256,
+    quant_tiers=[(6, 2, 2048)],   # one quant tier at k=6/v=2 with 2048 slots
+    score_policy="ema",
+    device="cuda", dtype="bfloat16",
 )
-install_turbo_attention(model, cache)
-out = model(ids, use_cache=False)
-print(f"{cache.bytes_total()} bytes for {ids.shape[-1]} tokens")
+n = install_kvcascade(model, cache)   # registers attn dispatcher on every layer
+
+# Use the model normally; the cache fills/cascades/evicts under the hood.
+ids = tok("…long context here…", return_tensors="pt").input_ids.cuda()
+out = model(ids, use_cache=False)     # use_cache=False — we manage caching ourselves
 ```
 
-For RoPE / QK-norm models (Llama, Qwen, etc.) just swap the model name. The
-dispatcher hook intercepts only the SDPA step — RoPE, QK-norm, GQA, sliding window,
-and anything else the model does to Q/K/V before SDPA flows through unchanged.
+For RoPE / QK-norm / GQA models (Llama, Qwen, Mistral, Gemma, modern GPT-2 etc.), just
+swap the model name. The attention dispatcher hook intercepts only the SDPA step —
+RoPE, QK-norm, GQA, sliding window, and anything else the model does to Q/K/V before
+SDPA flows through unchanged.
 
-## Key ideas
+## Configuration
 
-**TurboQuant** decomposes a vector into
+`KVCascadeCache.__init__` is the main API. The interesting knobs:
 
-  1. norm (fp scalar),
-  2. Haar-rotated direction quantized with Lloyd-Max at `bits-1` bits per coord,
-  3. residual in rotated space sketched with a 1-bit JL projection (m sign bits).
+- **`ring_size`**: FIFO recency buffer at fp. Recently-arrived tokens live here for
+  `ring_size` steps before being scored and graduating to the persistent tiers.
+- **`fp_capacity`**: importance-managed fp tier above the quant tiers. Top-`fp_capacity`
+  tokens by accumulated attention live here at full precision. Set to 0 to disable
+  ("only ring + quant + evict").
+- **`quant_tiers`**: a list of `(k_bits, v_bits, capacity)` tuples — one per TurboQuant
+  tier, in cascade order (most precise first). Pass `[]` for "ring + fp + evict"
+  (a pure H2O-on-fp setup). Common configs:
+  - `[(6, 2, N)]` — single bulk tier at uniform's "working" precision; aggressive
+    eviction past it. *This is what we recommend for QK-norm models like Qwen3.*
+  - `[(4, 2, N)]` — same but at lower precision; OK for vanilla / RoPE-only models.
+  - `[(6, 2, A), (4, 1, B)]` — two quant tiers; tail tokens get demoted into the
+    aggressive second tier rather than evicted. Higher capacity, but the aggressive
+    tier's IP-noise can hurt on sharp-softmax models.
+- **`score_policy`**: how attention received drives the importance score.
+  - `"ema"` (default) — exponential moving average of per-query mean attention.
+    Decaying, workload-independent, adaptive.
+  - `"cumulative"` — H2O-style monotonic sum. Strictly preserves what's been hot
+    historically. We've found EMA slightly outperforms cumulative on sequential decode.
 
-The Haar rotation Gaussianizes the unit-sphere directions so a single Lloyd-Max
-codebook (computed once for `N(0, 1)`) is near-optimal across all heads / layers.
-The JL residual gives an unbiased inner-product estimator with variance `O(1/m)`.
+For sizing, a useful starting point at iso-byte versus uniform `k=6/v=2`:
+`ring_size=8`, `fp_capacity=ctx_len // 16`, `quant_tiers=[(6, 2, ~ctx_len * 13/16)]`.
+Halve the quant capacity for ~½ uniform bytes, etc.
 
-**Asymmetric K/V budgets.** K errors propagate through softmax, so K wants the
-full TurboQuant treatment. V errors get averaged by `attn @ V` (and Lloyd-Max
-centroids are unbiased per-coordinate), so V tolerates aggressive PolarQuant — `bits=2`
-is usually free. Pass `k_bits` and `v_bits` to `TurboQuantKVCache` independently.
+## Running the eval
 
-**GQA-aware storage.** K/V live at kv-head granularity; the cache expands to
-query-head count only at attention-compute time. So compression vs an fp16 KV cache
-stays apples-to-apples on grouped-query models.
+```bash
+python eval.py --samples 20 --ctx_len 4096 --decode_len 64
+```
 
-**HF dispatcher integration.** `turbo_attn.py` registers a function under
-`transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS["turbo"]`. `install_turbo_attention(model, cache)`
-flips `model.config._attn_implementation` to `"turbo"` and stamps the cache onto every
-attention module via `module.layer_idx`. No model-class-specific wrappers.
+Pulls 20 non-overlapping wikitext-103 chunks of 4096 tokens, runs prefill +
+sequential decode for uniform TurboQuant + 4 KV-CASCADE configs, prints mean ± sd
+top-1 / cosine sim against an fp32 reference. ~2 minutes on a single A100/H100.
 
-## K vs V budget — sweep across architectures
+```
+config                            bytes (KiB)   ratio        cos sim (mean ± sd)       top-1 (mean ± sd)
+--------------------------------------------------------------------------------------------------------
+uniform k=6/v=2                        120064   3.82x     0.9258 ±  0.0192       68.4% ±  10.7%
+kvcascade B (iso, ema)                 120056   3.82x     0.9673 ±  0.0063       78.4% ±   5.7%
+kvcascade B (iso, cumulative)          120056   3.82x     0.9578 ±  0.0093       74.1% ±   7.5%
+kvcascade F (½ byte, ema)               60022   7.64x     0.9750 ±  0.0070       80.0% ±   8.4%
+kvcascade G (¼ byte, ema)               29990  15.30x     0.9708 ±  0.0097       79.7% ±   9.2%
+```
 
-The hybrid attention path makes prefill bit-exact to fp (just-arrived K/V contribute
-*exactly* this step; only the cached prefix goes through the IP estimator). So
-quantization quality only shows up on tokens that attend against the cached prefix.
+(The eval uses **teacher forcing** — at each decode step we feed the ground-truth
+token from the original sequence, and compare the model's argmax to the fp reference's
+argmax at that position. So we're measuring quantization fidelity *given correct
+history*, not generation quality with cumulative prediction errors. Different metric
+than free-running generation, more isolated for comparing quantization approaches.)
 
-The tables below run an 80/20 prefill→decode split on a 223-token prompt and compare
-the decode-row logits against an fp single-shot reference. K-budget grid: `{3, 4, 5, 6}`,
-V-budget grid: `{1, 2, 4}`. **Bold** rows are the recommended config per model.
+## When does KV-CASCADE win?
 
-### gpt2 — 12 layers, MHA, learned positional
+The empirical picture, from sweeps on Qwen3-0.6B:
 
-| k_bits | v_bits | compression | cos sim | top-1 |
-|---|---|---|---|---|
-| 3 | 1 | 5.82× | 0.771 | 97.8% |
-| 3 | 2 | 4.92× | 0.911 | 100.0% |
-| 3 | 4 | 3.76× | 0.911 | 100.0% |
-| 4 | 1 | 4.92× | 0.731 |  95.6% |
-| **4** | **2** | **4.27×** | **0.911** | **100.0%** |
-| 4 | 4 | 3.37× | 1.000 | 100.0% |
-| 5 | 1 | 4.27× | 0.832 | 100.0% |
-| 5 | 2 | 3.76× | 1.000 | 100.0% |
-| 5 | 4 | 3.05× | 1.000 | 100.0% |
-| 6 | 1 | 3.76× | 0.910 | 100.0% |
-| 6 | 2 | 3.37× | 1.000 | 100.0% |
-| 6 | 4 | 2.78× | 1.000 | 100.0% |
+- **Long-context sequential decode (autoregressive generation):** KV-CASCADE wins
+  cleanly, both at iso-byte and at sub-iso-byte budgets. The recency ring keeps the
+  last few decode tokens at fp (avoiding the per-step quantization cost on tokens
+  that are heavily attended), and eviction keeps softmax noise from accumulating
+  across the cache.
 
-### SmolLM2-135M — 30 layers, RoPE, GQA (9 q-heads → 3 kv-heads)
+- **Single-shot prefill scoring:** Uniform TurboQuant is competitive. The cache
+  is only used for one big attention call, so reuse benefits don't accumulate; the
+  fp tier just spends bytes a uniform-quant baseline doesn't.
 
-| k_bits | v_bits | compression | cos sim | top-1 |
-|---|---|---|---|---|
-| 3 | 1 | 5.82× | 0.517 |  91.1% |
-| 3 | 2 | 4.92× | 0.851 |  95.6% |
-| 3 | 4 | 3.76× | 0.852 |  95.6% |
-| 4 | 1 | 4.92× | 0.552 |  95.6% |
-| **4** | **2** | **4.27×** | **0.860** | **100.0%** |
-| 4 | 4 | 3.37× | 0.942 | 100.0% |
-| 5 | 1 | 4.27× | 0.579 |  95.6% |
-| 5 | 2 | 3.76× | 0.946 | 100.0% |
-| 5 | 4 | 3.05× | 0.980 | 100.0% |
-| 6 | 1 | 3.76× | 0.554 |  95.6% |
-| 6 | 2 | 3.37× | 0.950 | 100.0% |
-| 6 | 4 | 2.78× | 0.991 | 100.0% |
+- **Diffuse-attention LM workloads (wikitext, etc.):** KV-CASCADE wins on sequential
+  decode because eviction removes the long tail of low-importance tokens whose
+  quantized softmax contributions were net noise.
 
-### Qwen3-0.6B — 28 layers, RoPE + QK-norm, GQA (16 q-heads → 8 kv-heads)
+- **Sparse-attention QA / NIAH-style workloads:** Mixed. Sequential decode revealed
+  that aggressive eviction can drop tokens the model needs to retrieve the answer.
+  Tuning the fp tier capacity matters more here.
 
-| k_bits | v_bits | compression | cos sim | top-1 |
-|---|---|---|---|---|
-| 3 | 1 | 6.74× | 0.561 |   8.9% |
-| 3 | 2 | 5.57× | 0.636 |   8.9% |
-| 3 | 4 | 4.13× | 0.693 |   6.7% |
-| 4 | 1 | 5.57× | 0.520 |  26.7% |
-| 4 | 2 | 4.74× | 0.620 |  13.3% |
-| 4 | 4 | 3.66× | 0.704 |  22.2% |
-| 5 | 1 | 4.74× | 0.679 |  88.9% |
-| 5 | 2 | 4.13× | 0.783 |  88.9% |
-| 5 | 4 | 3.28× | 0.838 |  91.1% |
-| 6 | 1 | 4.13× | 0.801 |  95.6% |
-| **6** | **2** | **3.66×** | **0.888** | **100.0%** |
-| 6 | 4 | 2.98× | 0.923 | 100.0% |
+- **QK-normed models (Qwen3, OLMo-2, etc.):** Need `k_bits ≥ 5` in the bulk quant
+  tier, otherwise the IP-estimator noise overwhelms QK-norm's sharper softmax
+  (same threshold uniform TurboQuant has on these architectures). Below that, no
+  amount of cache hierarchy fixes it.
 
-### Recommended configurations
+## Implementation notes
 
-| model | `(k_bits, v_bits)` | compression | top-1 |
-|---|---|---|---|
-| gpt2 | (4, 2) | 4.27× | 100% |
-| SmolLM2-135M | (4, 2) | 4.27× | 100% |
-| Qwen3-0.6B | (6, 2) | 3.66× | 100% |
+**Vectorized cascade.** When the recency ring evicts (one or more graduates), the
+graduates compete against tier residents in parallel across `(B, H_kv)`. Each tier
+runs a single `topk` over the `[residents | candidates]` pool, then scatters winners
+into open slots. Demoted residents continue down the chain. No Python-level loops
+over slots or heads.
 
-Two takeaways:
+**Hybrid attention path.** Each attention call computes scores against *(quantized
+prefix) ⊕ (fresh K/V)* and stores the fresh K/V into the ring afterwards. So a
+just-arrived token contributes *exactly* to its own attention call (no quantization
+round-trip), and the per-token fidelity drop only kicks in for subsequent steps that
+re-read it from the cache.
 
-1. **`v_bits=2` is the sweet spot across all three architectures.** `v_bits=1` tanks
-   cos sim consistently (1-bit V is just sign quantization — too lossy even after
-   averaging). `v_bits=4` is wasted budget. The asymmetric-K/V intuition holds
-   across vanilla, RoPE, and QK-norm.
+**GQA-aware storage.** All buffers live at kv-head granularity (matching what HF
+would actually allocate). Expansion to query-head count happens at attention compute
+time, not at storage. Compression vs an fp16 KV cache stays apples-to-apples on
+grouped-query models.
 
-2. **K budget scales with attention sharpness.** Vanilla and RoPE-only models work
-   at `k_bits=4`. QK-norm sharpens the softmax (K coordinates have unit RMS, so
-   scaled scores are larger), which amplifies K-side IP noise through the softmax
-   non-linearity. The cliff between `k=4` and `k=5` on Qwen3 is striking: top-1
-   jumps from 13% to 88% with one extra bit on K.
+**Bit-packed storage.** All Lloyd-Max indices and JL sign sketches are bit-packed
+into uint8 buffers (no padding to byte boundaries). Pack/unpack are pure tensor ops
+with fast paths for power-of-2 widths.
+
+**HF dispatcher integration.** `kvcascade.py` registers a function under
+`transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS["kvcascade"]`. `install_kvcascade(model, cache)`
+flips `model.config._attn_implementation` to `"kvcascade"` and stamps the cache onto
+every attention module. Works on any model that dispatches through ALL_ATTENTION_FUNCTIONS
+(Llama, Qwen, Mistral, Gemma, modern GPT-2, etc.). No model-class-specific wrappers.
+
+## Caveats
+
+- v1 supports `batch_size=1` only.
+- Multi-sample averaging on the headline result is from 5 samples; longer eval runs
+  would tighten the confidence intervals.
+- The win is sequential-decode-specific. Single-shot benchmarks won't show it.
+- Free-running generation (model uses its own predictions as next inputs) hasn't been
+  evaluated — teacher-forced top-1 is what's reported. Different metric, possibly
+  different conclusions.

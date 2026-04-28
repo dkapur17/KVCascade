@@ -1,19 +1,18 @@
-"""Tiered KV cache with recency ring + N quantization tiers, per (layer, kv_head).
+"""KV-CASCADE: KV-Cache with Adaptive Score-based Compression And Demote-then-Evict.
 
-Tokens enter via a fp recency ring buffer. When the ring evicts (FIFO), the evicted
-token undergoes a competitive cascade through the persistent tiers:
+Tokens enter a fp recency ring buffer. When the ring evicts (FIFO), the evicted token
+undergoes a competitive cascade through the persistent tiers:
 
-    ring (fp) -> tier 1 (fp) -> tier 2 (TurboQuant regular) -> tier 3 (TurboQuant aggressive) -> evicted
+    ring (fp, FIFO) -> fp_tier (fp, importance) -> quant_tiers[0] -> ... -> evicted
 
-At each tier, the graduating token competes with the lowest-importance resident; if
-its EMA importance score beats theirs, it takes the slot and the displaced resident
-cascades to the next tier (re-quantized as it goes). Once placed, a token can only
-stay or demote — there is no promotion (matches the design discussion).
+At each tier, the graduating token competes with the lowest-importance resident; if its
+importance score beats theirs, it takes the slot and the displaced resident cascades to
+the next tier (re-quantized as it goes). Once placed, a token can only stay or demote —
+no promotions. Tokens that lose at every tier are evicted from the cache entirely.
 
-Importance is tracked per (layer, kv_head, slot) as an EMA of *per-query* attention
-weight (not summed-over-queries — the EMA is workload-independent). Effective decay
-over T_q queries in a single attention call is rho ** T_q, which makes prefill and
-decode behave as if the same sequence of single-query updates were applied.
+Two scoring policies for the importance signal (see `score_policy`):
+  - "ema":         per-query EMA of received attention; decays workload-independent.
+  - "cumulative":  H2O-style monotonic cumulative sum.
 
 The cascade is vectorized across (B, H_kv) and across all graduates: each tier runs a
 single topk over [residents | candidates] and uses scatter_/gather to install winners.
@@ -131,8 +130,7 @@ class TurboBuffer:
         """Dequantize every slot back to fp [B, H_kv, C, D] for K and V.
         Used by the cascade when residents are demoted to a lower tier.
         Note: the TurboQuant K reconstruction recovers only the MSE part; the QJL
-        sign bits exist solely for IP estimation and are dropped here. This is the
-        same lossy step that `reconstruct` does for the single-slot case.
+        sign bits exist solely for IP estimation and are dropped here.
         """
         D = self.head_dim
         L = layer_idx
@@ -179,14 +177,19 @@ class TurboBuffer:
 
 
 # ======================================================================================
-# TieredKVCache
+# KVCascadeCache
 # ======================================================================================
 
-class TieredKVCache:
-    """Recency ring + always-on fp tier + N configurable TurboQuant tiers, per (layer, kv-head).
+class KVCascadeCache:
+    """KV-Cache with Adaptive Score-based Compression And Demote-then-Evict.
 
-    Cascade order: ring (fp, FIFO) -> fp_tier (importance) -> quant_tiers[0] -> ... -> evict.
-    The TQ tiers are listed in cascade order; conventionally, earlier = more bits / less aggressive.
+    Architecture: recency ring + always-on fp tier + N configurable TurboQuant tiers,
+    per (layer, kv-head). Cascade order:
+
+        ring (fp, FIFO) -> fp_tier (importance) -> quant_tiers[0] -> ... -> evict.
+
+    The TQ tiers are listed in cascade order; conventionally, earlier = more bits / less
+    aggressive. Pass `quant_tiers=[]` for "ring + fp + evict" (H2O-on-fp).
     """
 
     def __init__(
@@ -223,8 +226,7 @@ class TieredKVCache:
                 - "cumulative": H2O-style cumulative sum across all attention received.
                   Monotonic — once a slot has accumulated attention, it stays heavy.
                   Workload-dependent (a 200-query prefill pumps 200× more into the
-                  score than one decode query). Best fit for one-shot retrieval where
-                  the relevant tokens are attended once and shouldn't be forgotten.
+                  score than one decode query).
             ema_decay: per-query EMA decay rho (used when score_policy="ema"). Effective
                 decay over a T_q-query attention call is rho ** T_q, so prefill and
                 decode behave consistently.
@@ -292,7 +294,7 @@ class TieredKVCache:
     def _cascade_vectorized(self, layer_idx: int,
                             cand_K: torch.Tensor, cand_V: torch.Tensor,
                             cand_pos: torch.Tensor, cand_score: torch.Tensor) -> None:
-        """Vectorized cascade through tier1 -> tier2 -> tier3.
+        """Vectorized cascade through fp_tier -> quant_tiers[0] -> quant_tiers[1] -> ...
 
         cand_K, cand_V: [B, H_kv, G, D] fp (graduates from the ring).
         cand_pos:       [B, H_kv, G] long.
@@ -395,9 +397,9 @@ class TieredKVCache:
         new_score_open = cand_score_f.gather(2, safe_cand)
 
         # A pair is "real" when both ends point inside their valid range AND the gathered
-        # candidate has a non-(-inf) score. We allow +inf (used by `pin_sinks` to mark
-        # un-evictable sinks); we reject -inf (which is how we mark padding / invalid
-        # entries that may have leaked into top-C when C exceeds the count of real candidates).
+        # candidate has a non-(-inf) score. We reject -inf (which is how we mark padding /
+        # invalid entries that may have leaked into top-C when C exceeds the count of real
+        # candidates).
         pair_valid = (cand_indices_chosen < G) & (open_slot_indices < C) & (new_score_open > _NEG_INF)
         new_pos_open   = torch.where(pair_valid, new_pos_open,   torch.full_like(new_pos_open, -1))
         new_score_open = torch.where(pair_valid, new_score_open, torch.zeros_like(new_score_open))
@@ -688,7 +690,7 @@ class TieredKVCache:
     # ======================================================================================
 
     def _scores_and_meta(self, layer_idx: int, q: torch.Tensor):
-        """Concatenated scores, positions, and validity across all 4 buffers.
+        """Concatenated scores, positions, and validity across all buffers.
         Returns:
             scores [B, H_q, T_q, Ctot]
             pos    [B, H_q, Ctot]
@@ -755,9 +757,9 @@ class TieredKVCache:
         scaling: Optional[float] = None,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute attention against (cached prefix in 4 buffers) ⊕ (fresh K/V).
+        """Compute attention against (cached prefix in all buffers) ⊕ (fresh K/V).
         After attention, fresh K/V are pushed into the ring (which may evict tokens
-        into the tier cascade), and importance scores are EMA-updated.
+        into the tier cascade), and importance scores are updated per `score_policy`.
 
         q     : [B, H_q,  T_q,   D]
         k_new : [B, H_kv, T_new, D]
@@ -828,12 +830,8 @@ class TieredKVCache:
 
         if self.score_policy == "ema":
             # Per-query mean attention (workload-independent: bounded in [0, 1] regardless of T_q).
-            # Effective decay over T_q queries is rho ** T_q, matching the result of
-            # T_q sequential single-query EMA updates with received ≈ constant.
             attn_cache_received = attn_cache_fp32.mean(dim=2)                      # [B, H_q, Ctot]
         else:  # "cumulative" — H2O-style sum
-            # Per-step sum: the score grows by total attention received this step.
-            # Workload-dependent (long prefill = big bump), monotonic non-decreasing.
             attn_cache_received = attn_cache_fp32.sum(dim=2)                       # [B, H_q, Ctot]
 
         if n_rep > 1:
@@ -854,9 +852,6 @@ class TieredKVCache:
             offset = hi
 
         # ----- seed initial scores for the new tokens -----
-        # Compute the per-query received attention for new tokens, normalized by T_q so
-        # that blocked queries contribute 0 (preserves sink signal). Then convert to
-        # whichever policy's score scale.
         attn_new = attn[..., Ctot:].to(torch.float32)                              # [B, H_q, T_q, T_new]
         attn_new_sum = attn_new.sum(dim=2)                                          # [B, H_q, T_new]
         if n_rep > 1:
@@ -880,10 +875,10 @@ class TieredKVCache:
 # HF dispatcher integration
 # ======================================================================================
 
-def tiered_attn_function(module, query, key, value, attention_mask=None,
-                         scaling=None, dropout=0.0, **kwargs):
-    """HF ALL_ATTENTION_FUNCTIONS callable for the tiered cache."""
-    cache: TieredKVCache = module._tiered_cache
+def kvcascade_attn_function(module, query, key, value, attention_mask=None,
+                            scaling=None, dropout=0.0, **kwargs):
+    """HF ALL_ATTENTION_FUNCTIONS callable for KV-CASCADE."""
+    cache: KVCascadeCache = module._kvcascade
     layer_idx: int = module.layer_idx
 
     out = cache.attention(layer_idx, query, k_new=key, v_new=value,
@@ -894,22 +889,22 @@ def tiered_attn_function(module, query, key, value, attention_mask=None,
 
 try:
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-    ALL_ATTENTION_FUNCTIONS["tiered"] = tiered_attn_function
+    ALL_ATTENTION_FUNCTIONS["kvcascade"] = kvcascade_attn_function
 except ImportError:
     ALL_ATTENTION_FUNCTIONS = None
 
 
-def install_tiered_attention(model: nn.Module, cache: TieredKVCache) -> int:
-    """Switch the model's attention dispatcher to 'tiered' and attach the cache."""
+def install_kvcascade(model: nn.Module, cache: KVCascadeCache) -> int:
+    """Switch the model's attention dispatcher to 'kvcascade' and attach the cache."""
     if ALL_ATTENTION_FUNCTIONS is None:
         raise RuntimeError("transformers is required")
     if hasattr(model, "config"):
-        _force_set_attn_impl(model.config, "tiered")
+        _force_set_attn_impl(model.config, "kvcascade")
     n = 0
     for module in model.modules():
         if hasattr(module, "config") and module is not model:
-            _force_set_attn_impl(module.config, "tiered")
+            _force_set_attn_impl(module.config, "kvcascade")
         if hasattr(module, "layer_idx") and isinstance(module.layer_idx, int):
-            module._tiered_cache = cache
+            module._kvcascade = cache
             n += 1
     return n

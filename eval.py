@@ -1,4 +1,4 @@
-"""Robust sequential-decode evaluation of TieredKVCache vs uniform TurboQuantKVCache
+"""Robust sequential-decode evaluation of KVCascadeCache vs uniform TurboQuantKVCache
 on wikitext-103, against an fp reference. CUDA-targeted, bf16 throughout.
 
 Methodology:
@@ -13,7 +13,7 @@ Methodology:
   3. Aggregate top-1 / cosine similarity across all samples. Report mean ± stdev.
 
 Run:
-    python scripts/eval_wikitext_seq.py --samples 20 --ctx_len 4096 --decode_len 64
+    python eval.py --samples 20 --ctx_len 4096 --decode_len 64
 
 Outputs the table at the end. Optionally writes per-sample raw CSV via --csv.
 """
@@ -34,7 +34,7 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from tiered_cache import TieredKVCache, install_tiered_attention
+from kvcascade import KVCascadeCache, install_kvcascade
 from turbo_attn import TurboQuantKVCache, install_turbo_attention, _force_set_attn_impl
 
 
@@ -113,8 +113,8 @@ def make_uniform(n_l, n_q, n_kv, D, ctx_len, k_bits, v_bits, seed, device, dtype
     )
 
 
-def make_tiered(n_l, n_q, n_kv, D, R, fp_cap, qt, policy, seed, device, dtype):
-    return TieredKVCache(
+def make_kvcascade(n_l, n_q, n_kv, D, R, fp_cap, qt, policy, seed, device, dtype):
+    return KVCascadeCache(
         num_layers=n_l, batch_size=1, num_heads=n_q, num_kv_heads=n_kv,
         head_dim=D, ring_size=R, fp_capacity=fp_cap, quant_tiers=qt,
         score_policy=policy, m=D, seed=seed, device=device, dtype=dtype,
@@ -124,7 +124,7 @@ def make_tiered(n_l, n_q, n_kv, D, R, fp_cap, qt, policy, seed, device, dtype):
 def build_configs(n_l, n_q, n_kv, D, ctx_len, seed, device, dtype):
     """Return list of (label, cache_factory, install_fn).
 
-    Tiered configs:
+    KV-CASCADE configs:
       - "B" lands at iso-byte (matches uniform's footprint).
       - "F" lands at ~½ uniform bytes.
       - "G" lands at ~¼ uniform bytes.
@@ -132,8 +132,8 @@ def build_configs(n_l, n_q, n_kv, D, ctx_len, seed, device, dtype):
     fp_capacity scales with ctx_len (fp_cap ≈ ctx_len/16 for B, /32 for F, /64 for G)
     so the design's "fraction of context held at fp" stays constant — otherwise iso-byte
     at large ctx_len has fp_cap negligibly small and the design degenerates to "uniform
-    with a small ring." Each tiered config keeps R=8 fp ring + that fp tier + a
-    `k=6/v=2` quant tier sized to fit the byte target. Eviction past tier 2.
+    with a small ring." Each KV-CASCADE config keeps R=8 fp ring + that fp tier + a
+    `k=6/v=2` quant tier sized to fit the byte target. Eviction past the quant tier.
     """
     fp_bytes_scalar = torch.empty((), dtype=dtype).element_size()
     fp_slot_bytes = 2 * D * fp_bytes_scalar              # K+V per slot in fp ring/tier
@@ -146,7 +146,7 @@ def build_configs(n_l, n_q, n_kv, D, ctx_len, seed, device, dtype):
     print(f"target B/(L,kv) = {target_bytes_per_lh}, fp slot = {fp_slot_bytes}, "
           f"turbo slot = {turbo_slot_bytes}", flush=True)
 
-    def tiered_for(R, fp_cap, target_bytes, policy):
+    def cascade_for(R, fp_cap, target_bytes, policy):
         budget = target_bytes - R * fp_slot_bytes - fp_cap * fp_slot_bytes
         qt_cap = max(0, budget // turbo_slot_bytes)
         return (R, fp_cap, [(6, 2, int(qt_cap))], policy)
@@ -155,10 +155,10 @@ def build_configs(n_l, n_q, n_kv, D, ctx_len, seed, device, dtype):
     fp_cap_F = max(4, ctx_len // 32)
     fp_cap_G = max(2, ctx_len // 64)
 
-    B_ema = tiered_for(8, fp_cap_B, target_bytes_per_lh,       "ema")
-    B_cum = tiered_for(8, fp_cap_B, target_bytes_per_lh,       "cumulative")
-    F_ema = tiered_for(8, fp_cap_F, target_bytes_per_lh // 2, "ema")
-    G_ema = tiered_for(8, fp_cap_G, target_bytes_per_lh // 4, "ema")
+    B_ema = cascade_for(8, fp_cap_B, target_bytes_per_lh,       "ema")
+    B_cum = cascade_for(8, fp_cap_B, target_bytes_per_lh,       "cumulative")
+    F_ema = cascade_for(8, fp_cap_F, target_bytes_per_lh // 2, "ema")
+    G_ema = cascade_for(8, fp_cap_G, target_bytes_per_lh // 4, "ema")
     print(f"  B: R=8 fp={fp_cap_B} qt={B_ema[2][0][2]}", flush=True)
     print(f"  F: R=8 fp={fp_cap_F} qt={F_ema[2][0][2]}", flush=True)
     print(f"  G: R=8 fp={fp_cap_G} qt={G_ema[2][0][2]}", flush=True)
@@ -170,18 +170,18 @@ def build_configs(n_l, n_q, n_kv, D, ctx_len, seed, device, dtype):
         ("uniform k=6/v=2",
          factory(make_uniform, n_l, n_q, n_kv, D, ctx_len, 6, 2, seed, device, dtype),
          install_turbo_attention),
-        ("tiered B (iso, ema)",
-         factory(make_tiered, n_l, n_q, n_kv, D, *B_ema, seed, device, dtype),
-         install_tiered_attention),
-        ("tiered B (iso, cumulative)",
-         factory(make_tiered, n_l, n_q, n_kv, D, *B_cum, seed, device, dtype),
-         install_tiered_attention),
-        ("tiered F (½ byte, ema)",
-         factory(make_tiered, n_l, n_q, n_kv, D, *F_ema, seed, device, dtype),
-         install_tiered_attention),
-        ("tiered G (¼ byte, ema)",
-         factory(make_tiered, n_l, n_q, n_kv, D, *G_ema, seed, device, dtype),
-         install_tiered_attention),
+        ("kvcascade B (iso, ema)",
+         factory(make_kvcascade, n_l, n_q, n_kv, D, *B_ema, seed, device, dtype),
+         install_kvcascade),
+        ("kvcascade B (iso, cumulative)",
+         factory(make_kvcascade, n_l, n_q, n_kv, D, *B_cum, seed, device, dtype),
+         install_kvcascade),
+        ("kvcascade F (½ byte, ema)",
+         factory(make_kvcascade, n_l, n_q, n_kv, D, *F_ema, seed, device, dtype),
+         install_kvcascade),
+        ("kvcascade G (¼ byte, ema)",
+         factory(make_kvcascade, n_l, n_q, n_kv, D, *G_ema, seed, device, dtype),
+         install_kvcascade),
     ]
     return cfgs
 
