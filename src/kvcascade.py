@@ -304,9 +304,16 @@ class KVCascadeCache:
         """
         for tier_idx, tier in enumerate(self._tier_chain):
             is_quant = self._tier_is_quantized[tier_idx]
-            cand_K, cand_V, cand_pos, cand_score = self._compete_at_tier(
-                tier, layer_idx, cand_K, cand_V, cand_pos, cand_score, is_quant
-            )
+            # G=1 fast path (decode hot path): skip topk pool / full dequantize_all,
+            # just compare against the tier's lowest-scored slot per (B, H_kv).
+            if cand_score.shape[-1] == 1:
+                cand_K, cand_V, cand_pos, cand_score = self._compete_at_tier_g1(
+                    tier, layer_idx, cand_K, cand_V, cand_pos, cand_score, is_quant
+                )
+            else:
+                cand_K, cand_V, cand_pos, cand_score = self._compete_at_tier(
+                    tier, layer_idx, cand_K, cand_V, cand_pos, cand_score, is_quant
+                )
             # Early exit: if all remaining candidate scores are -inf, nothing to cascade.
             if torch.isinf(cand_score).all() and (cand_score <= 0).all():
                 break
@@ -431,6 +438,140 @@ class KVCascadeCache:
                               cand_K, cand_V, safe_cand,
                               new_pos_open, new_score_open,
                               is_quantized)
+
+        return next_K, next_V, next_pos, next_score
+
+    def _compete_at_tier_g1(self, tier, layer_idx: int,
+                             cand_K: torch.Tensor, cand_V: torch.Tensor,
+                             cand_pos: torch.Tensor, cand_score: torch.Tensor,
+                             is_quantized: bool):
+        """Single-candidate (G=1) fast path equivalent to ``_compete_at_tier``.
+
+        Per (B, H_kv): find the tier's lowest-scored slot. If the candidate beats it,
+        install the candidate there and the displaced resident becomes the next-tier
+        candidate; otherwise the tier is left untouched and the candidate cascades down
+        unchanged. Avoids the topk pool, scatter sentinel pairing, and (for quantized
+        tiers) the full ``dequantize_all`` — only one slot is unpacked / decoded /
+        encoded per (B, H_kv).
+        """
+        B = self.batch_size
+        H_kv = self.num_kv_heads
+        C = tier.capacity
+        D = self.head_dim
+        score_dtype = torch.float32
+
+        if C == 0:
+            return cand_K, cand_V, cand_pos, cand_score
+
+        # ---- 1. Find tier min slot per (B, H_kv); invalid slots count as -inf. ----
+        res_pos = tier.pos[layer_idx]                                              # [B, H_kv, C]
+        res_valid = res_pos >= 0                                                   # [B, H_kv, C]
+        res_score = tier.score[layer_idx].to(score_dtype)                          # [B, H_kv, C]
+        NEG = torch.full_like(res_score, _NEG_INF)
+        res_score_masked = torch.where(res_valid, res_score, NEG)
+        min_score, min_idx = res_score_masked.min(dim=-1)                          # [B, H_kv]
+
+        # ---- 2. Decide swap vs pass-through per head. ----
+        cand_score_2d = cand_score.squeeze(-1).to(score_dtype)                     # [B, H_kv]
+        should_swap = cand_score_2d > min_score                                    # [B, H_kv]
+
+        # If no head wants to swap, the tier is untouched and the candidate passes through
+        # unchanged. Skip the gather/encode/scatter machinery entirely.
+        if not bool(should_swap.any()):
+            return cand_K, cand_V, cand_pos, cand_score
+
+        idx_3d = min_idx.unsqueeze(-1)                                             # [B, H_kv, 1]
+        idx_4d_D = min_idx.view(B, H_kv, 1, 1).expand(B, H_kv, 1, D)               # [B, H_kv, 1, D]
+
+        # ---- 3. Read displaced data at min_idx (one slot per head). ----
+        evicted_pos_2d   = res_pos.gather(-1, idx_3d).squeeze(-1)                  # [B, H_kv]
+        evicted_score_2d = res_score.gather(-1, idx_3d).squeeze(-1)                # [B, H_kv] (fp32)
+        evicted_valid_2d = res_valid.gather(-1, idx_3d).squeeze(-1)                # [B, H_kv]
+
+        if is_quantized:
+            bk = tier._bytes_k_idx
+            bv = tier._bytes_v_idx
+            bs = tier._bytes_k_sign
+            idx_4d_kbytes = min_idx.view(B, H_kv, 1, 1).expand(B, H_kv, 1, bk)
+            idx_4d_vbytes = min_idx.view(B, H_kv, 1, 1).expand(B, H_kv, 1, bv)
+            idx_4d_sbytes = min_idx.view(B, H_kv, 1, 1).expand(B, H_kv, 1, bs)
+
+            k_idx_packed_at_min     = tier.k_idx_packed[layer_idx].gather(2, idx_4d_kbytes)        # [B, H_kv, 1, bk]
+            k_ressign_packed_at_min = tier.k_ressign_packed[layer_idx].gather(2, idx_4d_sbytes)    # [B, H_kv, 1, bs]
+            v_idx_packed_at_min     = tier.v_idx_packed[layer_idx].gather(2, idx_4d_vbytes)        # [B, H_kv, 1, bv]
+
+            k_norm_at_min    = tier.k_norm[layer_idx].gather(-1, idx_3d)           # [B, H_kv, 1]
+            k_resnorm_at_min = tier.k_resnorm[layer_idx].gather(-1, idx_3d)
+            v_norm_at_min    = tier.v_norm[layer_idx].gather(-1, idx_3d)
+
+            # Reconstruct the one slot's K/V to fp (skip JL signs — only used for IP estimation,
+            # not reconstruction).
+            k_idx_at_min = unpack_bits(k_idx_packed_at_min, tier._k_idx_bits, D)   # [B, H_kv, 1, D]
+            v_idx_at_min = unpack_bits(v_idx_packed_at_min, tier._v_idx_bits, D)
+            R = tier.k_quantizers[layer_idx].R
+            u_hat_at_min = tier.k_quantizers[layer_idx].mse_quantizer.decode_rotated(k_idx_at_min)
+            evicted_K = k_norm_at_min.unsqueeze(-1) * (u_hat_at_min @ R)           # [B, H_kv, 1, D]
+            evicted_V = tier.v_quantizers[layer_idx].decode(v_norm_at_min, v_idx_at_min)
+        else:
+            evicted_K = tier.K[layer_idx].gather(2, idx_4d_D)                      # [B, H_kv, 1, D]
+            evicted_V = tier.V[layer_idx].gather(2, idx_4d_D)
+
+        # ---- 4. Install candidate at min_idx, gated by should_swap per head. ----
+        swap_4d_D = should_swap.view(B, H_kv, 1, 1).expand(B, H_kv, 1, D)
+        swap_3d   = should_swap.unsqueeze(-1)                                      # [B, H_kv, 1]
+
+        # pos / score: where(should_swap, cand_*, current_*), then scatter at min_idx.
+        new_pos_at_min   = torch.where(should_swap, cand_pos.squeeze(-1), evicted_pos_2d).unsqueeze(-1)
+        new_score_at_min = torch.where(should_swap, cand_score_2d,        evicted_score_2d).unsqueeze(-1)
+        tier.pos[layer_idx].scatter_(-1, idx_3d, new_pos_at_min)
+        tier.score[layer_idx].scatter_(-1, idx_3d, new_score_at_min.to(tier.score.dtype))
+
+        if is_quantized:
+            # Encode the one candidate K/V (G=1: cheap).
+            cand_kq = tier.k_quantizers[layer_idx].quantize(cand_K)                # cand_K: [B, H_kv, 1, D]
+            cand_v_norm, cand_v_idx = tier.v_quantizers[layer_idx].encode(cand_V)
+            cand_sign01 = (cand_kq.res_signs.long() + 1) >> 1
+            cand_k_idx_packed     = pack_bits(cand_kq.x_indices, tier._k_idx_bits)     # [B, H_kv, 1, bk]
+            cand_k_ressign_packed = pack_bits(cand_sign01, 1)                          # [B, H_kv, 1, bs]
+            cand_v_idx_packed     = pack_bits(cand_v_idx, tier._v_idx_bits)            # [B, H_kv, 1, bv]
+
+            # For each field, write cand value at min_idx if should_swap, else leave the slot alone.
+            new_k_norm    = torch.where(swap_3d, cand_kq.x_norm,    k_norm_at_min)
+            new_k_resnorm = torch.where(swap_3d, cand_kq.res_norm,  k_resnorm_at_min)
+            new_v_norm    = torch.where(swap_3d, cand_v_norm,       v_norm_at_min)
+            tier.k_norm[layer_idx].scatter_(-1, idx_3d, new_k_norm.to(tier.k_norm.dtype))
+            tier.k_resnorm[layer_idx].scatter_(-1, idx_3d, new_k_resnorm.to(tier.k_resnorm.dtype))
+            tier.v_norm[layer_idx].scatter_(-1, idx_3d, new_v_norm.to(tier.v_norm.dtype))
+
+            swap_4d_bk = should_swap.view(B, H_kv, 1, 1).expand(B, H_kv, 1, bk)
+            swap_4d_bs = should_swap.view(B, H_kv, 1, 1).expand(B, H_kv, 1, bs)
+            swap_4d_bv = should_swap.view(B, H_kv, 1, 1).expand(B, H_kv, 1, bv)
+            new_k_idx_packed     = torch.where(swap_4d_bk, cand_k_idx_packed,     k_idx_packed_at_min)
+            new_k_ressign_packed = torch.where(swap_4d_bs, cand_k_ressign_packed, k_ressign_packed_at_min)
+            new_v_idx_packed     = torch.where(swap_4d_bv, cand_v_idx_packed,     v_idx_packed_at_min)
+            tier.k_idx_packed[layer_idx].scatter_(2, idx_4d_kbytes, new_k_idx_packed)
+            tier.k_ressign_packed[layer_idx].scatter_(2, idx_4d_sbytes, new_k_ressign_packed)
+            tier.v_idx_packed[layer_idx].scatter_(2, idx_4d_vbytes, new_v_idx_packed)
+        else:
+            new_K_at_min = torch.where(swap_4d_D, cand_K, evicted_K)
+            new_V_at_min = torch.where(swap_4d_D, cand_V, evicted_V)
+            tier.K[layer_idx].scatter_(2, idx_4d_D, new_K_at_min)
+            tier.V[layer_idx].scatter_(2, idx_4d_D, new_V_at_min)
+
+        # ---- 5. Build next-tier candidate stream. ----
+        # Swap-and-valid: propagate the displaced resident downward.
+        # No swap: propagate the original candidate.
+        # Swap-and-invalid (filled an empty slot): no real eviction; mark score = -inf so it dies.
+        next_K   = torch.where(swap_4d_D, evicted_K, cand_K)
+        next_V   = torch.where(swap_4d_D, evicted_V, cand_V)
+        next_pos = torch.where(swap_3d, evicted_pos_2d.unsqueeze(-1), cand_pos)
+
+        swap_and_valid = should_swap & evicted_valid_2d
+        next_score = torch.where(
+            swap_and_valid.unsqueeze(-1),
+            evicted_score_2d.unsqueeze(-1).to(cand_score.dtype),
+            torch.where(swap_3d, torch.full_like(cand_score, _NEG_INF), cand_score),
+        )
 
         return next_K, next_V, next_pos, next_score
 
