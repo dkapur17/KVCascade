@@ -969,17 +969,25 @@ class KVCascadeCache:
         Ctot = cache_pos.shape[-1]
         attn_cache_fp32 = attn[..., :Ctot].to(torch.float32)                       # [B, H_q, T_q, Ctot]
 
+        rho = self.ema_decay
+        effective_rho = rho ** T_q
+
         if self.score_policy == "ema":
-            # Per-query mean attention (workload-independent: bounded in [0, 1] regardless of T_q).
-            attn_cache_received = attn_cache_fp32.mean(dim=2)                      # [B, H_q, Ctot]
-        else:  # "cumulative" — H2O-style sum
+            # Per-query EMA: treat each query position as one EMA tick. Weight at q is
+            # (1-rho)*rho^(T_q-1-q) — most recent query gets (1-rho), older queries decay
+            # exponentially. Weights sum to (1-rho^T_q) so the total impact of one batched
+            # call matches a sequence of T_q sequential EMA updates. For T_q=1 (decode) this
+            # is exactly (1-rho)*attn[0]; for T_q>1 (prefill) it weights recent queries
+            # (e.g. an end-of-prefill question) more than older ones.
+            q_weights = (1.0 - rho) * rho ** torch.arange(
+                T_q - 1, -1, -1, device=q.device, dtype=torch.float32
+            )                                                                       # [T_q]
+            attn_cache_received = (attn_cache_fp32 * q_weights.view(1, 1, T_q, 1)).sum(dim=2)
+        else:  # "cumulative" — H2O-style sum, unchanged
             attn_cache_received = attn_cache_fp32.sum(dim=2)                       # [B, H_q, Ctot]
 
         if n_rep > 1:
             attn_cache_received = attn_cache_received.view(B, H_kv, n_rep, Ctot).sum(dim=2)
-
-        rho = self.ema_decay
-        effective_rho = rho ** T_q
 
         # Build per-buffer slices in declaration order (ring, fp_tier, *quant_tiers).
         offset = 0
@@ -987,22 +995,27 @@ class KVCascadeCache:
             lo, hi = offset, offset + buf.capacity
             received = attn_cache_received[:, :, lo:hi].to(buf.score.dtype)
             if self.score_policy == "ema":
-                buf.score[layer_idx] = effective_rho * buf.score[layer_idx] + (1 - effective_rho) * received
+                # received already encodes the (1 - rho^T_q) total weight from per-query
+                # weighting, so the update is just decay-old + add-received.
+                buf.score[layer_idx] = effective_rho * buf.score[layer_idx] + received
             else:  # "cumulative"
                 buf.score[layer_idx] = buf.score[layer_idx] + received
             offset = hi
 
         # ----- seed initial scores for the new tokens -----
         attn_new = attn[..., Ctot:].to(torch.float32)                              # [B, H_q, T_q, T_new]
-        attn_new_sum = attn_new.sum(dim=2)                                          # [B, H_q, T_new]
-        if n_rep > 1:
-            attn_new_sum = attn_new_sum.view(B, H_kv, n_rep, T_new).sum(dim=2)      # [B, H_kv, T_new]
-
         if self.score_policy == "ema":
-            attn_new_mean = attn_new_sum / float(T_q)
-            new_received_init = (1 - effective_rho) * attn_new_mean                # one effective EMA step from prior 0
+            # Same per-query weighting as above. Causal masking on attn_new already zeros
+            # entries q < p for new token at position p, so the weighted sum naturally
+            # restricts to queries that could have attended to this token.
+            attn_new_received = (attn_new * q_weights.view(1, 1, T_q, 1)).sum(dim=2)
         else:  # "cumulative"
-            new_received_init = attn_new_sum                                        # cumulative starts from 0 + sum_attn
+            attn_new_received = attn_new.sum(dim=2)
+
+        if n_rep > 1:
+            attn_new_received = attn_new_received.view(B, H_kv, n_rep, T_new).sum(dim=2)
+
+        new_received_init = attn_new_received
 
         # ----- ingest into ring (may trigger cascade) -----
         self._ingest_into_ring(layer_idx, k_new, v_new, new_positions,
