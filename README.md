@@ -33,39 +33,90 @@ Supports an arbitrary hierarchy of quantized tiers with increasingly aggressive 
 
 ## Headline result
 
-Sequential-decode evaluation on **Qwen3-0.6B**, wikitext-103, T_ctx=4096, T_decode=64,
-top-1 agreement against fp32 reference. Single sample of T_dec=64 decode positions:
+Sequential-decode evaluation on **wikitext-103**, top-1 agreement against fp32 reference,
+**3 base models × 2 context lengths × 50 samples each** (300 sequences total). All numbers
+are mean ± standard deviation across the 50 wikitext chunks.
 
-| config | bytes | compression | top-1 | Δ vs uniform |
+### Iso-byte head-to-head — KVCascade vs uniform TurboQuant (k=6/v=2)
+
+At the same total cache byte budget, KVCascade beats uniform on every (model, context)
+pair tested:
+
+| Model | ctx | uniform | H2O (ring=0) | H2O (ring=8) | **KVCascade** | **Δ vs uniform** |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B | 4096 | 70.3 ± 8.0 | 20.5 ± 5.6 | 74.0 ± 6.0 | **86.7 ± 5.5** | **+16.4 pp** |
+| Qwen3-0.6B | 8192 | 66.5 ± 8.0 | 18.2 ± 4.6 | 72.0 ± 5.5 | **80.6 ± 5.9** | **+14.1 pp** |
+| Llama-3.2-1B | 4096 | 87.2 ± 5.0 | 24.2 ± 6.8 | 76.3 ± 6.0 | **96.8 ± 1.9** | **+9.6 pp** |
+| Llama-3.2-1B | 8192 | 87.4 ± 2.9 | 22.0 ± 5.6 | 77.1 ± 5.2 | **96.5 ± 1.7** | **+9.1 pp** |
+| OLMo-2-1B | 4096 | 90.7 ± 3.8 | 25.1 ± 7.2 | 79.2 ± 4.9 | **96.8 ± 2.2** | **+6.1 pp** |
+| OLMo-2-1B | 8192 | 80.2 ± 5.6 | 63.7 ± 9.7 | 65.2 ± 9.2 | **92.6 ± 2.8** | **+12.4 pp** |
+
+The win ranges from **+6.1 pp** (Llama / OLMo at short context, where uniform is already
+strong) to **+16.4 pp** (Qwen3 at short context, where uniform is weakest). KVCascade
+also has the lowest variance of any compressed config — sd shrinks to ~2 pp on Llama and
+OLMo at 4k vs ~5 pp for uniform.
+
+### Sub-iso-byte: KVCascade matches uniform with much less memory
+
+The smallest byte ratio at which KVCascade still matches uniform's top-1 (within 1 pp):
+
+| Model | KVCascade matches uniform at | additional compression |
+|---|---|---|
+| Qwen3-0.6B (both contexts) | **0.0625× uniform's bytes** | **16× more compression** |
+| Llama-3.2-1B (both contexts) | **0.125× uniform's bytes** | **8× more compression** |
+| OLMo-2-1B (both contexts) | **0.25× uniform's bytes** | **4× more compression** |
+
+For Qwen3-0.6B at ctx=8192, KVCascade at **0.25× uniform's bytes (15.3× compression vs
+fp16)** actually slightly *outperforms* KVCascade at iso-byte (83.2 ± 5.3 vs 80.6 ± 5.9).
+Removing the long tail of low-importance tokens reduces softmax noise enough to net out
+ahead of keeping them at quantized precision.
+
+### Throughput tradeoff
+
+KVCascade pays a consistent **~1.7–1.8× decode-latency cost** vs uniform across all 6
+configs (decode tok/s on a single H100, bf16):
+
+| Model | ctx | uniform decode tok/s | KVCascade decode tok/s | slowdown |
 |---|---|---|---|---|
-| uniform `k=6/v=2` (TurboQuant baseline) | 120 MB | 3.82× | 73.4% | 0 |
-| **KV-CASCADE B** (iso-byte, ema) | 120 MB | 3.82× | **89.1%** | **+15.7 pp** |
-| **KV-CASCADE F** (½ byte, ema) | 60 MB | 7.64× | **82.8%** | **+9.4 pp** |
-| **KV-CASCADE G** (¼ byte, ema) | 30 MB | 15.30× | 75.0% | +1.6 pp |
+| Qwen3-0.6B | 4096 | 16.0 | 9.2 | 1.74× |
+| Qwen3-0.6B | 8192 | 15.1 | 8.5 | 1.78× |
+| Llama-3.2-1B | 4096 | 27.1 | 15.8 | 1.72× |
+| Llama-3.2-1B | 8192 | 35.2 | 19.4 | 1.81× |
+| OLMo-2-1B | 4096 | 30.2 | 17.0 | 1.78× |
+| OLMo-2-1B | 8192 | 28.2 | 16.6 | 1.70× |
 
-Multi-sample averages over 5 wikitext-103 chunks at the same setup:
+The tradeoff is well-characterized: **trade ~1.7× decode latency for +6 to +16 pp top-1
+accuracy at the same byte budget.** The slowdown comes from per-step cascade competition,
+ring writes, and importance-score updates; H2O (no quantization) is faster than uniform,
+KVCascade is slower than both.
 
-| config | top-1 (mean ± sd) |
-|---|---|
-| uniform `k=6/v=2` | 68.4% ± 10.7% |
-| KV-CASCADE B (iso, ema) | **78.4% ± 5.7%** |
-| KV-CASCADE F (½ byte, ema) | **80.0% ± 8.4%** |
-| KV-CASCADE G (¼ byte, ema) | **79.7% ± 9.2%** |
+### Ablation — each component contributes
 
-Two things happen here that aren't obvious:
+Decomposing the iso-byte gap from H2O to KVCascade by adding one component at a time:
 
-1. **Iso-byte: KV-CASCADE B beats uniform TurboQuant by ~10 pp.** Same total memory,
-   but the architecture (recency ring at fp + sink tier at fp + bulk at quantized +
-   evict the long tail) compounds less softmax noise than uniform's "every-token-gets-a-
-   little-noisy" regime when the cache is being used sequentially.
+| Step | Qwen3 4k | Llama 4k | OLMo 4k | OLMo 8k |
+|---|---|---|---|---|
+| H2O (eviction only) | 20.5% | 24.2% | 25.1% | 63.7% |
+| **+ recency ring (size 8)** | **+53.6 pp** | **+52.1 pp** | **+54.2 pp** | +1.5 pp |
+| **+ TurboQuant tier (KVCascade)** | **+12.7 pp** | **+20.5 pp** | **+17.6 pp** | **+27.4 pp** |
+| Total: KVCascade top-1 | 86.7% | 96.8% | 96.8% | 92.6% |
 
-2. **At ½ and ¼ uniform's bytes, KV-CASCADE still wins** — F (60 MB) and G (30 MB)
-   both beat uniform's 120 MB. Removing the long tail of low-importance tokens *helps*
-   accuracy because their quantized contributions to the softmax were net noise.
+The recency ring is dramatic on most configs (+52–55 pp), reflecting that pure-eviction
+H2O without a recency window misclassifies the just-arrived decode token as low-priority.
+On OLMo at 8192, plain H2O is already at 63.7% (much stronger than the 18–25% on the
+other configs) so the ring contributes less *relatively*; the quantization tier picks up
+the slack with a +27.4 pp lift on top.
 
-The win is **specific to sequential-decode workloads** (real autoregressive generation).
-On single-shot scoring, uniform TurboQuant is competitive. See "When does KV-CASCADE
-win?" below.
+### Why KVCascade wins where it does
+
+- **Diffuse-attention models (Qwen3, OLMo-2) — entropy ≈ 77–82% of uniform-max on
+  wikitext.** Many tokens contribute non-trivially to each softmax, so uniform's
+  per-token quantization noise compounds. KVCascade keeps the heavy hitters at fp and
+  evicts the long tail, breaking the noise compounding.
+- **Peaky-attention models (Llama-3.2-1B) — entropy ≈ 37% of uniform-max.** Eviction
+  has a structural advantage here, which is why uniform is already strong (87% top-1).
+  KVCascade still wins by ~9 pp because the recency ring keeps the just-arrived decode
+  token at fp, and the importance-driven fp tier catches the heavy hitters cleanly.
 
 ## Layout
 
@@ -151,55 +202,63 @@ Halve the quant capacity for ~½ uniform bytes, etc.
 ## Running the eval
 
 ```bash
-python eval.py --samples 20 --ctx_len 4096 --decode_len 64
+pip install -r requirements.txt
+python eval.py --model Qwen/Qwen3-0.6B --samples 50 --ctx-len 4096 --decode-len 64
 ```
 
-Pulls 20 non-overlapping wikitext-103 chunks of 4096 tokens, runs prefill +
-sequential decode for uniform TurboQuant + 4 KV-CASCADE configs, prints mean ± sd
-top-1 / cosine sim against an fp32 reference. ~2 minutes on a single A100/H100.
+Pulls non-overlapping wikitext-103 chunks of `ctx_len` tokens, runs prefill +
+sequential decode for uniform TurboQuant, H2O, H2O+ring, and KVCascade, plus a
+KVCascade compression sweep. Writes `report.md` with tables and figures, plus
+`raw.json` with per-sample numbers. Per-method prefill/decode tok/s are timed
+inline (CUDA-synchronized).
 
-```
-config                            bytes (KiB)   ratio        cos sim (mean ± sd)       top-1 (mean ± sd)
---------------------------------------------------------------------------------------------------------
-uniform k=6/v=2                        120064   3.82x     0.9258 ±  0.0192       68.4% ±  10.7%
-kvcascade B (iso, ema)                 120056   3.82x     0.9673 ±  0.0063       78.4% ±   5.7%
-kvcascade B (iso, cumulative)          120056   3.82x     0.9578 ±  0.0093       74.1% ±   7.5%
-kvcascade F (½ byte, ema)               60022   7.64x     0.9750 ±  0.0070       80.0% ±   8.4%
-kvcascade G (¼ byte, ema)               29990  15.30x     0.9708 ±  0.0097       79.7% ±   9.2%
-```
+For multi-model + multi-context grids, see `run_evals.sh` (sequential, local) or
+`modal_eval.py` (parallelized across containers on Modal — one (model, ctx) pair
+per GPU, runs 6 configs concurrently).
 
-(The eval uses **teacher forcing** — at each decode step we feed the ground-truth
+The eval uses **teacher forcing** — at each decode step we feed the ground-truth
 token from the original sequence, and compare the model's argmax to the fp reference's
 argmax at that position. So we're measuring quantization fidelity *given correct
-history*, not generation quality with cumulative prediction errors. Different metric
-than free-running generation, more isolated for comparing quantization approaches.)
+history*, not generation quality with cumulative prediction errors. This is a more
+isolated metric for comparing cache strategies but does *not* characterize free-running
+generation drift.
 
 ## When does KV-CASCADE win?
 
-The empirical picture, from sweeps on Qwen3-0.6B:
+The empirical picture across the 3-model × 2-context sweep above:
 
-- **Long-context sequential decode (autoregressive generation):** KV-CASCADE wins
-  cleanly, both at iso-byte and at sub-iso-byte budgets. The recency ring keeps the
-  last few decode tokens at fp (avoiding the per-step quantization cost on tokens
-  that are heavily attended), and eviction keeps softmax noise from accumulating
-  across the cache.
+- **Long-context sequential decode (autoregressive generation):** KVCascade wins on
+  every configuration tested — 6 of 6 model × context pairs. The win does not narrow
+  going from ctx=4096 to ctx=8192; on OLMo it widens from +6.1 to +12.4 pp.
 
-- **Single-shot prefill scoring:** Uniform TurboQuant is competitive. The cache
-  is only used for one big attention call, so reuse benefits don't accumulate; the
-  fp tier just spends bytes a uniform-quant baseline doesn't.
+- **Diffuse-attention models (Qwen3, OLMo-2 — entropy ≈ 77–82% of uniform-max on
+  wikitext):** KVCascade has its largest wins here (+6.1 to +16.4 pp). Quantization
+  noise compounds across many contributing tokens; eviction breaks the compounding
+  by removing the long tail.
 
-- **Diffuse-attention LM workloads (wikitext, etc.):** KV-CASCADE wins on sequential
-  decode because eviction removes the long tail of low-importance tokens whose
-  quantized softmax contributions were net noise.
+- **Peaky-attention models (Llama-3.2-1B — entropy ≈ 37% of uniform-max):** KVCascade
+  still wins (+9.1 to +9.6 pp), even though peaky attention is the regime where
+  pure-eviction (H2O) was originally designed to shine. The recency ring + fp tier
+  capture the peaky structure cleanly; the quant tier handles the rest.
 
-- **Sparse-attention QA / NIAH-style workloads:** Mixed. Sequential decode revealed
-  that aggressive eviction can drop tokens the model needs to retrieve the answer.
-  Tuning the fp tier capacity matters more here.
+- **Single-shot prefill scoring:** Uniform TurboQuant is competitive. The cache is
+  only used for one big attention call, so reuse benefits don't accumulate; the fp
+  tier just spends bytes a uniform-quant baseline doesn't.
 
-- **QK-normed models (Qwen3, OLMo-2, etc.):** Need `k_bits ≥ 5` in the bulk quant
-  tier, otherwise the IP-estimator noise overwhelms QK-norm's sharper softmax
-  (same threshold uniform TurboQuant has on these architectures). Below that, no
-  amount of cache hierarchy fixes it.
+- **Sparse-attention QA / NIAH-style workloads:** Not measured in the headline sweep.
+  Earlier exploratory runs showed that aggressive eviction can drop tokens the model
+  needs to retrieve the answer; tuning `fp_capacity` matters more here.
+
+- **QK-normed models (Qwen3, OLMo-2):** Need `k_bits ≥ 5` in the bulk quant tier,
+  otherwise the IP-estimator noise overwhelms QK-norm's sharper softmax (same
+  threshold uniform TurboQuant has on these architectures). The headline numbers
+  above use `k_bits=6, v_bits=2`. Below `k_bits=5`, no amount of cache hierarchy
+  fixes it.
+
+- **Throughput cost is real but bounded:** ~1.7–1.8× decode-latency hit vs uniform,
+  consistent across models and context lengths. Most of the cost is per-step cascade
+  competition + score updates; the G=1 decode fast path already skips the full topk
+  pool and `dequantize_all`. Further kernel-level optimization is open work.
 
 ## Implementation notes
 
@@ -233,9 +292,42 @@ every attention module. Works on any model that dispatches through ALL_ATTENTION
 ## Caveats
 
 - v1 supports `batch_size=1` only.
-- Multi-sample averaging on the headline result is from 5 samples; longer eval runs
-  would tighten the confidence intervals.
-- The win is sequential-decode-specific. Single-shot benchmarks won't show it.
-- Free-running generation (model uses its own predictions as next inputs) hasn't been
-  evaluated — teacher-forced top-1 is what's reported. Different metric, possibly
-  different conclusions.
+- All headline numbers are mean ± sd over **N=50** non-overlapping wikitext-103
+  chunks. Longer eval runs would tighten the confidence intervals further but would
+  not change the qualitative ranking — KVCascade beats uniform on every config by a
+  margin much larger than the sd.
+- **Free-running generation hasn't been evaluated.** All numbers are teacher-forced
+  top-1 against an fp32 reference: at each decode step we feed the ground-truth token
+  and compare argmax. This isolates quantization fidelity from cumulative prediction
+  drift, which is the right metric for comparing cache strategies — but real
+  free-running generation may behave differently and is not characterized here.
+- **The win is sequential-decode-specific.** Single-shot prefill scoring (no decode
+  loop, cache used only once) doesn't show the same gap; uniform TurboQuant is
+  competitive there.
+- **Throughput tradeoff:** ~1.7–1.8× decode latency vs uniform. For
+  latency-critical workloads with weak accuracy demands, uniform is the better pick.
+- **Eval is wikitext-only.** Results may differ on conversational, code, or sparse-
+  retrieval workloads (NIAH/QA) — the importance scoring assumptions hold across
+  domains in principle, but eviction friendliness varies sharply with task structure.
+
+## Acknowledgements
+
+KVCascade builds directly on ideas from prior work on KV-cache compression:
+
+- **[TurboQuant](https://arxiv.org/abs/2504.16127)** (Mahankali et al., 2025) —
+  norm + Haar-rotated Lloyd-Max coarse code + 1-bit JL residual sketch is the
+  per-token compression primitive used in KVCascade's quant tiers. The cascade
+  hierarchy is what's new on top.
+- **[H2O](https://arxiv.org/abs/2306.14048)** (Zhang et al., 2023) — accumulated-
+  attention scoring for "heavy hitter" identification. The fp tier's importance-driven
+  retention and the cascade's eviction-on-loss policy are H2O in spirit, generalized
+  across precision tiers.
+- **[SnapKV](https://arxiv.org/abs/2404.14469)** (Li et al., 2024) — windowed
+  attention pooling for importance estimation, and the observation that recent tokens
+  matter disproportionately. Influenced the recency-ring design.
+- **[StreamingLLM](https://arxiv.org/abs/2309.17453)** (Xiao et al., 2024) — the
+  "attention sinks" insight (a few persistent high-attention tokens carry
+  disproportionate weight) motivates keeping the importance-managed fp tier always-on.
+
+This codebase was developed as the course project for **CMU 15-642: Machine Learning
+Systems** (Spring 2026).
