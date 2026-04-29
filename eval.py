@@ -88,7 +88,8 @@ def parse_args():
     p.add_argument("--skip-viz",  action="store_true")
     p.add_argument("--skip-exp1", action="store_true")
     p.add_argument("--skip-exp2", action="store_true")
-    p.add_argument("--skip-exp3", action="store_true")
+    # exp3 defaults to skipped; pass --no-skip-exp3 to bring it back.
+    p.add_argument("--skip-exp3", default=True, action=argparse.BooleanOptionalAction)
     return p.parse_args()
 
 
@@ -133,7 +134,7 @@ def get_dims(model) -> dict:
 
 
 def get_samples(tok, n_samples: int, ctx_len: int):
-    ds = load_dataset("wikitext", "wikitext-103-v1", split="test", streaming=True)
+    ds = load_dataset("wikitext", "wikitext-103-v1", split="train", streaming=True)
     chunks, total_chars = [], 0
     target_chars = n_samples * ctx_len * 6
     for item in ds:
@@ -143,7 +144,12 @@ def get_samples(tok, n_samples: int, ctx_len: int):
             if total_chars >= target_chars:
                 break
     big_text = "".join(chunks)
+    # Bump model_max_length so the corpus tokenization doesn't print a length warning;
+    # we chunk to ctx_len below before any model forward.
+    saved_max_len = tok.model_max_length
+    tok.model_max_length = int(1e12)
     all_ids = tok(big_text, return_tensors="pt").input_ids[0]
+    tok.model_max_length = saved_max_len
     out = []
     for i in range(n_samples):
         s, e = i * ctx_len, (i + 1) * ctx_len
@@ -247,15 +253,28 @@ def make_kvc(args, dims: dict, dtype, device, ring_size: int, fp_capacity: int, 
 # ============================================================================
 
 def sequential_decode(model, ids, T_pre: int, T_dec: int, device):
+    """Returns (logits[B, T_dec, V], prefill_seconds, decode_seconds).
+    Both timings are CUDA-synchronized so they reflect actual GPU work."""
     with torch.no_grad():
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
         model(input_ids=ids[:, :T_pre], use_cache=False)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t_pre = time.perf_counter() - t0
+
         out_list = []
+        t1 = time.perf_counter()
         for k in range(T_dec):
             iid = ids[:, T_pre + k:T_pre + k + 1]
             pid = torch.tensor([[T_pre + k]], device=device, dtype=torch.long)
             o = model(input_ids=iid, position_ids=pid, use_cache=False)
             out_list.append(o.logits)
-    return torch.cat(out_list, dim=1)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t_dec = time.perf_counter() - t1
+    return torch.cat(out_list, dim=1), t_pre, t_dec
 
 
 def evaluate_config(model, cache, install_fn, samples, ref_decs,
@@ -263,17 +282,24 @@ def evaluate_config(model, cache, install_fn, samples, ref_decs,
     install_fn(model, cache)
     bytes_total = cache.bytes_total()
     cos_list, top1_list = [], []
+    pre_times, dec_times = [], []
     t0 = time.time()
     for ids, ref in zip(samples, ref_decs):
         ids_d = ids.to(device)
         ref_d = ref.to(device)
         cache.reset()
-        logits = sequential_decode(model, ids_d, T_pre, T_dec, device).float()
+        logits, t_pre, t_dec = sequential_decode(model, ids_d, T_pre, T_dec, device)
+        logits = logits.float()
+        pre_times.append(t_pre)
+        dec_times.append(t_dec)
         cos_list.append(F.cosine_similarity(logits, ref_d, dim=-1).mean().item())
         top1_list.append((logits.argmax(-1) == ref_d.argmax(-1)).float().mean().item())
         del logits, ref_d
         torch.cuda.empty_cache()
     elapsed = time.time() - t0
+    n = len(samples)
+    total_pre = sum(pre_times)
+    total_dec = sum(dec_times)
     return {
         "label": label,
         "bytes": int(bytes_total),
@@ -282,13 +308,20 @@ def evaluate_config(model, cache, install_fn, samples, ref_decs,
         "cos_mean":  statistics.mean(cos_list),
         "cos_std":   statistics.stdev(cos_list) if len(cos_list) > 1 else 0.0,
         "top1": top1_list, "cos": cos_list, "elapsed_s": elapsed,
+        "prefill_s_per_sample": total_pre / n if n else 0.0,
+        "decode_s_per_sample":  total_dec / n if n else 0.0,
+        "prefill_tok_per_s": (n * T_pre) / total_pre if total_pre > 0 else float("nan"),
+        "decode_tok_per_s":  (n * T_dec) / total_dec if total_dec > 0 else float("nan"),
     }
 
 
 def fmt_result(r: dict) -> str:
+    dec_tps = r.get("decode_tok_per_s", float("nan"))
+    pre_tps = r.get("prefill_tok_per_s", float("nan"))
     return (f"top1 = {r['top1_mean']*100:5.1f}% ± {r['top1_std']*100:4.1f}%  "
             f"cos = {r['cos_mean']:.4f} ± {r['cos_std']:.4f}  "
             f"bytes = {r['bytes']/1024:>8.0f} KiB  "
+            f"prefill = {pre_tps:>7.1f} tok/s  decode = {dec_tps:>5.1f} tok/s  "
             f"({r['elapsed_s']:.0f}s)")
 
 
@@ -527,13 +560,24 @@ def exp2_iso_byte(model, samples, ref_decs, args, dims, dtype, device,
                                   T_pre, args.decode_len, device, "uniform")
         print(f"  {fmt_result(res_uni)}", flush=True)
 
-    # H2O at iso-byte.
+    # H2O at iso-byte (eviction only, no recency ring).
     h2o_cap = int(UB // fp_slot_bytes(dims, dtype))
     print(f"running H2O @ iso-byte (cache_size={h2o_cap}, ring=0)...", flush=True)
     res_h2o = evaluate_config(model, make_h2o(args, dims, dtype, device, h2o_cap),
                               install_kvcascade, samples, ref_decs,
                               T_pre, args.decode_len, device, "h2o")
     print(f"  {fmt_result(res_h2o)}", flush=True)
+
+    # H2O + recency ring at iso-byte (ablation: adds the recency buffer to plain H2O,
+    # isolating the ring's contribution before quantization is layered on top).
+    print(f"running H2O+ring @ iso-byte (cache_size={h2o_cap}, ring={args.ring_size})...", flush=True)
+    res_h2o_ring = evaluate_config(
+        model,
+        make_h2o(args, dims, dtype, device, h2o_cap, recency_window=args.ring_size),
+        install_kvcascade, samples, ref_decs,
+        T_pre, args.decode_len, device, "h2o+ring",
+    )
+    print(f"  {fmt_result(res_h2o_ring)}", flush=True)
 
     # KVCascade at iso-byte: reuse Exp 1's 1.0× row if present.
     kvc_iso = None
@@ -558,16 +602,20 @@ def exp2_iso_byte(model, samples, ref_decs, args, dims, dtype, device,
         ("full-fp (ref)", full_fp),
         ("uniform k=6/v=2", res_uni),
         ("H2O (ring=0)", res_h2o),
+        (f"H2O (ring={args.ring_size})", res_h2o_ring),
         ("KVCascade (ring + fp + quant)", kvc_iso),
     ]
 
-    # Bar plot (skip full-fp since it's by-construction 100%).
-    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+    # Bar plot (skip full-fp since it's by-construction 100%). Color order traces the
+    # ablation: uniform (gray) → H2O (red, eviction-only) → H2O+ring (orange, +recency)
+    # → KVCascade (blue, +quantization).
+    fig, ax = plt.subplots(1, 1, figsize=(9, 5))
     plot_rows = [(name, r) for name, r in rows if "ref" not in name]
     names = [n for n, _ in plot_rows]
     top1s = [r["top1_mean"] * 100 for _, r in plot_rows]
     errs  = [r["top1_std"]  * 100 for _, r in plot_rows]
-    bars = ax.bar(names, top1s, yerr=errs, capsize=5, color=["#888", "#d97", "#79b"])
+    bars = ax.bar(names, top1s, yerr=errs, capsize=5,
+                  color=["#888", "#c66", "#e9a23b", "#79b"])
     ax.axhline(100, color="green", ls=":", alpha=0.7, label="full-fp upper bound")
     ax.set_ylabel("top-1 (%)")
     ax.set_ylim(0, 105)
@@ -638,12 +686,25 @@ def _trim(r: dict) -> dict:
     return {k: v for k, v in r.items() if k not in ("top1", "cos")}
 
 
+def _fmt_tps(v) -> str:
+    if v is None:
+        return "—"
+    try:
+        if math.isnan(float(v)):
+            return "—"
+    except (TypeError, ValueError):
+        return "—"
+    return f"{float(v):.1f}"
+
+
 def _row_md(name: str, bytes_b: int, fp16_total: int, top1_m: float, top1_s: float,
-            cos_m: float, cos_s: float) -> str:
+            cos_m: float, cos_s: float,
+            pre_tps=None, dec_tps=None) -> str:
     ratio = fp16_total / bytes_b if bytes_b > 0 else float("inf")
     return (f"| {name} | {bytes_b/1024:,.0f} | {ratio:.2f}× | "
             f"{top1_m*100:.1f}% ± {top1_s*100:.1f}% | "
-            f"{cos_m:.4f} ± {cos_s:.4f} |")
+            f"{cos_m:.4f} ± {cos_s:.4f} | "
+            f"{_fmt_tps(pre_tps)} | {_fmt_tps(dec_tps)} |")
 
 
 def write_report(out_dir: Path, args, dims: dict, runtime_s: float,
@@ -705,15 +766,18 @@ def write_report(out_dir: Path, args, dims: dict, runtime_s: float,
         L.append("")
         L.append("How few bytes does KVCascade need to match uniform TurboQuant's quality?")
         L.append("")
-        L.append("| Config | Bytes (KiB) | Compression vs fp16 | Top-1 | Cos sim |")
-        L.append("|---|---|---|---|---|")
+        L.append("| Config | Bytes (KiB) | Compression vs fp16 | Top-1 | Cos sim | Prefill (tok/s) | Decode (tok/s) |")
+        L.append("|---|---|---|---|---|---|---|")
         L.append(_row_md("uniform `k=6/v=2`", exp1["uniform"]["bytes"], fp16_total,
                           exp1["uniform"]["top1_mean"], exp1["uniform"]["top1_std"],
-                          exp1["uniform"]["cos_mean"],  exp1["uniform"]["cos_std"]))
+                          exp1["uniform"]["cos_mean"],  exp1["uniform"]["cos_std"],
+                          exp1["uniform"].get("prefill_tok_per_s"),
+                          exp1["uniform"].get("decode_tok_per_s")))
         for r in exp1["rows"]:
             label = f"KVCascade @ {r['ratio']:.4g}× (fp={r['fp_cap']}, qt={r['qt_cap']})"
             L.append(_row_md(label, r["bytes"], fp16_total,
-                              r["top1_mean"], r["top1_std"], r["cos_mean"], r["cos_std"]))
+                              r["top1_mean"], r["top1_std"], r["cos_mean"], r["cos_std"],
+                              r.get("prefill_tok_per_s"), r.get("decode_tok_per_s")))
         L.append("")
         if exp1["headline"]:
             L.append(f"**Headline**: KVCascade {exp1['headline']}.")
@@ -726,23 +790,34 @@ def write_report(out_dir: Path, args, dims: dict, runtime_s: float,
         L.append("")
         L.append("At the same byte budget (= uniform's), compare four cache strategies.")
         L.append("")
-        L.append("| Config | Bytes (KiB) | Compression vs fp16 | Top-1 | Cos sim |")
-        L.append("|---|---|---|---|---|")
+        L.append("| Config | Bytes (KiB) | Compression vs fp16 | Top-1 | Cos sim | Prefill (tok/s) | Decode (tok/s) |")
+        L.append("|---|---|---|---|---|---|---|")
         for name, r in exp2["rows"]:
             L.append(_row_md(name, r["bytes"], fp16_total,
-                              r["top1_mean"], r["top1_std"], r["cos_mean"], r["cos_std"]))
+                              r["top1_mean"], r["top1_std"], r["cos_mean"], r["cos_std"],
+                              r.get("prefill_tok_per_s"), r.get("decode_tok_per_s")))
         L.append("")
         L.append("![Iso-byte bar chart](figures/exp2_isobyte.png)")
         L.append("")
-        # Auto-observation
+        # Auto-observation: ablation deltas (uniform → H2O → H2O+ring → KVCascade).
         rows_d = {n: r for n, r in exp2["rows"]}
+        h2o_ring_key = f"H2O (ring={args.ring_size})"
         if "uniform k=6/v=2" in rows_d and "KVCascade (ring + fp + quant)" in rows_d:
-            uni = rows_d["uniform k=6/v=2"]["top1_mean"]
-            kvc = rows_d["KVCascade (ring + fp + quant)"]["top1_mean"]
-            h2o = rows_d.get("H2O (ring=0)", {}).get("top1_mean")
+            uni      = rows_d["uniform k=6/v=2"]["top1_mean"]
+            kvc      = rows_d["KVCascade (ring + fp + quant)"]["top1_mean"]
+            h2o      = rows_d.get("H2O (ring=0)",  {}).get("top1_mean")
+            h2o_ring = rows_d.get(h2o_ring_key,    {}).get("top1_mean")
             L.append(f"**Δ at iso-byte**: KVCascade vs uniform = {(kvc-uni)*100:+.1f} pp.")
             if h2o is not None:
-                L.append(f"  H2O vs uniform = {(h2o-uni)*100:+.1f} pp.")
+                L.append(f"  H2O (ring=0) vs uniform = {(h2o-uni)*100:+.1f} pp.")
+            if h2o_ring is not None:
+                L.append(f"  H2O (ring={args.ring_size}) vs uniform = {(h2o_ring-uni)*100:+.1f} pp.")
+                if h2o is not None:
+                    L.append(f"  Recency-ring lift on H2O = {(h2o_ring-h2o)*100:+.1f} pp "
+                             f"(adding ring={args.ring_size} on top of plain H2O).")
+            if h2o_ring is not None:
+                L.append(f"  Quantization lift on H2O+ring = {(kvc-h2o_ring)*100:+.1f} pp "
+                         f"(KVCascade adds the quant tier on top of H2O+ring).")
             L.append("")
 
     if exp3 is not None:
@@ -751,13 +826,14 @@ def write_report(out_dir: Path, args, dims: dict, runtime_s: float,
         L.append(f"Total bytes fixed at uniform's iso-byte budget. `ring_size={args.ring_size}` "
                  f"throughout; `fp_capacity` is swept and `quant_capacity` is derived from the budget.")
         L.append("")
-        L.append("| ring | fp_cap | qt_cap | Bytes (KiB) | Top-1 | Cos sim |")
-        L.append("|---|---|---|---|---|---|")
+        L.append("| ring | fp_cap | qt_cap | Bytes (KiB) | Top-1 | Cos sim | Prefill (tok/s) | Decode (tok/s) |")
+        L.append("|---|---|---|---|---|---|---|---|")
         for r in exp3["rows"]:
             L.append(f"| {args.ring_size} | {r['fp_cap']} | {r['qt_cap']} | "
                      f"{r['bytes']/1024:,.0f} | "
                      f"{r['top1_mean']*100:.1f}% ± {r['top1_std']*100:.1f}% | "
-                     f"{r['cos_mean']:.4f} ± {r['cos_std']:.4f} |")
+                     f"{r['cos_mean']:.4f} ± {r['cos_std']:.4f} | "
+                     f"{_fmt_tps(r.get('prefill_tok_per_s'))} | {_fmt_tps(r.get('decode_tok_per_s'))} |")
         L.append("")
         if exp3["best"]:
             b = exp3["best"]
