@@ -1,0 +1,231 @@
+{
+  "args": {
+    "model": "Qwen/Qwen3-0.6B",
+    "samples": 50,
+    "ctx_len": 8192,
+    "decode_len": 128,
+    "device": "cuda",
+    "dtype": "bfloat16",
+    "seed": 42,
+    "out": "/outputs/qwen3_0.6B_8k",
+    "viz_ctx_len": 1024,
+    "k_bits": 6,
+    "v_bits": 2,
+    "ring_size": 8,
+    "exp1_ratios": "1.0,0.5,0.25,0.125,0.0625",
+    "exp3_fp_caps": "0,32,64,128,256,512,1024",
+    "threshold_pp": 1.0,
+    "skip_viz": false,
+    "skip_exp1": false,
+    "skip_exp2": false,
+    "skip_exp3": true
+  },
+  "dims": {
+    "n_layers": 28,
+    "n_heads": 16,
+    "n_kv_heads": 8,
+    "head_dim": 128
+  },
+  "runtime_s": 5376.916788578033,
+  "viz": {
+    "entropy_mean": 5.697051048278809,
+    "entropy_median": 6.25309944152832,
+    "entropy_min": 0.39033830165863037,
+    "entropy_max": 6.909726142883301,
+    "uniform_max": 6.931471805599453,
+    "peaky": [
+      0,
+      3
+    ],
+    "diffuse": [
+      17,
+      0
+    ],
+    "viz_ctx_len": 1024
+  },
+  "exp1": {
+    "uniform": {
+      "label": "uniform",
+      "bytes": 245891072,
+      "top1_mean": 0.66484375,
+      "top1_std": 0.08029899309711619,
+      "cos_mean": 0.8904411625862122,
+      "cos_std": 0.02870897598704422,
+      "elapsed_s": 458.3304965496063,
+      "prefill_s_per_sample": 0.5997174629400013,
+      "decode_s_per_sample": 8.494667604139998,
+      "prefill_tok_per_s": 13446.331811763104,
+      "decode_tok_per_s": 15.068276472362186
+    },
+    "rows": [
+      {
+        "ratio": 1.0,
+        "fp_cap": 512,
+        "qt_cap": 6205,
+        "label": "KVC @ 1.0000x  (ring=8, fp=512, qt=6205)",
+        "bytes": 245887040,
+        "top1_mean": 0.805625,
+        "top1_std": 0.058647190765576125,
+        "cos_mean": 0.9700703954696656,
+        "cos_std": 0.010621051673469224,
+        "elapsed_s": 879.1724715232849,
+        "prefill_s_per_sample": 2.4116766841399953,
+        "decode_s_per_sample": 15.017672113100012,
+        "prefill_tok_per_s": 3343.7317916748966,
+        "decode_tok_per_s": 8.523291695012091
+      },
+      {
+        "ratio": 0.5,
+        "fp_cap": 256,
+        "qt_cap": 3087,
+        "label": "KVC @ 0.5000x  (ring=8, fp=256, qt=3087)",
+        "bytes": 122937024,
+        "top1_mean": 0.82328125,
+        "top1_std": 0.05140935629688135,
+        "cos_mean": 0.9742098736763001,
+        "cos_std": 0.012795328231905542,
+        "elapsed_s": 839.8033604621887,
+        "prefill_s_per_sample": 1.7770838593400093,
+        "decode_s_per_sample": 14.879325274999992,
+        "prefill_tok_per_s": 4537.771224254373,
+        "decode_tok_per_s": 8.602540614866696
+      },
+      {
+        "ratio": 0.25,
+        "fp_cap": 128,
+        "qt_cap": 1528,
+        "label": "KVC @ 0.2500x  (ring=8, fp=128, qt=1528)",
+        "bytes": 61462016,
+        "top1_mean": 0.8325,
+        "top1_std": 0.05308465604963607,
+        "cos_mean": 0.9724457716941833,
+        "cos_std": 0.015619080120241442,
+        "elapsed_s": 803.2060265541077,
+        "prefill_s_per_sample": 1.2445000865600195,
+        "decode_s_per_sample": 14.676069323220009,
+        "prefill_tok_per_s": 6479.710276509563,
+        "decode_tok_per_s": 8.721681342665947
+      },
+      {
+        "ratio": 0.125,
+        "fp_cap": 64,
+        "qt_cap": 748,
+        "label": "KVC @ 0.1250x  (ring=8, fp=64, qt=748)",
+        "bytes": 30709504,
+        "top1_mean": 0.79765625,
+        "top1_std": 0.05927274526016169,
+        "cos_mean": 0.9643546235561371,
+        "cos_std": 0.0195166439731678,
+        "elapsed_s": 799.2162551879883,
+        "prefill_s_per_sample": 1.136353273140021,
+        "decode_s_per_sample": 14.777413741759982,
+        "prefill_tok_per_s": 7096.384716451076,
+        "decode_tok_per_s": 8.661867511923319
+      },
+      {
+        "ratio": 0.0625,
+        "fp_cap": 32,
+        "qt_cap": 359,
+        "label": "KVC @ 0.0625x  (ring=8, fp=32, qt=359)",
+        "bytes": 15363264,
+        "top1_mean": 0.7528125,
+        "top1_std": 0.06551177672014866,
+        "cos_mean": 0.9530910289287567,
+        "cos_std": 0.023736927671575134,
+        "elapsed_s": 793.141078710556,
+        "prefill_s_per_sample": 1.1977885404399786,
+        "decode_s_per_sample": 14.588647187560019,
+        "prefill_tok_per_s": 6732.407038255588,
+        "decode_tok_per_s": 8.773945819263332
+      }
+    ],
+    "headline": "matches uniform within 1.0 pp at 0.0625\u00d7 bytes (= 16.0\u00d7 compression vs uniform)",
+    "uniform_bytes_per_lh": 1097728
+  },
+  "exp2": {
+    "rows": [
+      [
+        "full-fp (ref)",
+        {
+          "label": "full-fp (ref)",
+          "bytes": 939524096,
+          "top1_mean": 1.0,
+          "top1_std": 0.0,
+          "cos_mean": 1.0,
+          "cos_std": 0.0,
+          "elapsed_s": 0.0
+        }
+      ],
+      [
+        "uniform k=6/v=2",
+        {
+          "label": "uniform",
+          "bytes": 245891072,
+          "top1_mean": 0.66484375,
+          "top1_std": 0.08029899309711619,
+          "cos_mean": 0.8904411625862122,
+          "cos_std": 0.02870897598704422,
+          "elapsed_s": 458.3304965496063,
+          "prefill_s_per_sample": 0.5997174629400013,
+          "decode_s_per_sample": 8.494667604139998,
+          "prefill_tok_per_s": 13446.331811763104,
+          "decode_tok_per_s": 15.068276472362186
+        }
+      ],
+      [
+        "H2O (ring=0)",
+        {
+          "label": "h2o",
+          "bytes": 245891072,
+          "top1_mean": 0.18203125,
+          "top1_std": 0.046374077308742705,
+          "cos_mean": 0.5230588209629059,
+          "cos_std": 0.05420305206433528,
+          "elapsed_s": 347.1689705848694,
+          "prefill_s_per_sample": 1.0471425224200357,
+          "decode_s_per_sample": 5.818031269460025,
+          "prefill_tok_per_s": 7700.957441173727,
+          "decode_tok_per_s": 22.000569277084644
+        }
+      ],
+      [
+        "H2O (ring=8)",
+        {
+          "label": "h2o+ring",
+          "bytes": 245891072,
+          "top1_mean": 0.72,
+          "top1_std": 0.055228284644237305,
+          "cos_mean": 0.9616133892536163,
+          "cos_std": 0.013818990870727585,
+          "elapsed_s": 418.7984368801117,
+          "prefill_s_per_sample": 1.0546298314801061,
+          "decode_s_per_sample": 7.238810332600005,
+          "prefill_tok_per_s": 7646.28475252088,
+          "decode_tok_per_s": 17.68246357050572
+        }
+      ],
+      [
+        "KVCascade (ring + fp + quant)",
+        {
+          "ratio": 1.0,
+          "fp_cap": 512,
+          "qt_cap": 6205,
+          "label": "KVC @ 1.0000x  (ring=8, fp=512, qt=6205)",
+          "bytes": 245887040,
+          "top1_mean": 0.805625,
+          "top1_std": 0.058647190765576125,
+          "cos_mean": 0.9700703954696656,
+          "cos_std": 0.010621051673469224,
+          "elapsed_s": 879.1724715232849,
+          "prefill_s_per_sample": 2.4116766841399953,
+          "decode_s_per_sample": 15.017672113100012,
+          "prefill_tok_per_s": 3343.7317916748966,
+          "decode_tok_per_s": 8.523291695012091
+        }
+      ]
+    ],
+    "uniform_bytes": 1097728,
+    "fp16_baseline_bytes": 939524096
+  },
+  "exp3": null
+}
