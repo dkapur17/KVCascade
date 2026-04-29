@@ -670,11 +670,11 @@ class KVCascadeCache:
                                 K_new: torch.Tensor, V_new: torch.Tensor,
                                 positions_t: torch.Tensor,
                                 init_scores: torch.Tensor) -> None:
-        """One-shot prefill ingestion when the cache is empty and T_new > R.
+        """One-shot prefill ingestion when the cache is empty.
 
         Cascade competition with empty tiers is equivalent to a global rank-by-score
         and contiguous assignment. So:
-          - Last R tokens fill the recency ring.
+          - Last R tokens fill the recency ring (skipped entirely if R == 0).
           - The remaining T_new - R tokens are sorted by initial score (per (B, H_kv));
             top fp_tier.capacity go to fp_tier, next quant_tiers[0].capacity go to
             quant_tiers[0], and so on. Anything past the last tier is dropped.
@@ -685,16 +685,18 @@ class KVCascadeCache:
         B, H_kv, T_new, D = K_new.shape
         R = self.ring.capacity
         device = K_new.device
-        cursor = int(self.ring_cursor[layer_idx, 0, 0].item())
 
-        # 1. Last R tokens to the ring. Match the existing overflow path's slot mapping.
-        write_offsets = (cursor + T_new - R + torch.arange(R, device=device)) % R
-        self.ring.K[layer_idx, :, :, write_offsets, :] = K_new[:, :, T_new - R:, :]
-        self.ring.V[layer_idx, :, :, write_offsets, :] = V_new[:, :, T_new - R:, :]
-        self.ring.pos[layer_idx, :, :, write_offsets] = (
-            positions_t[T_new - R:].view(1, 1, R).expand(B, H_kv, R)
-        )
-        self.ring.score[layer_idx, :, :, write_offsets] = init_scores[:, :, T_new - R:]
+        # 1. Last R tokens to the ring (skip entirely when R == 0 — H2O-style mode where
+        # tokens go directly into the persistent tiers without a recency window).
+        if R > 0:
+            cursor = int(self.ring_cursor[layer_idx, 0, 0].item())
+            write_offsets = (cursor + T_new - R + torch.arange(R, device=device)) % R
+            self.ring.K[layer_idx, :, :, write_offsets, :] = K_new[:, :, T_new - R:, :]
+            self.ring.V[layer_idx, :, :, write_offsets, :] = V_new[:, :, T_new - R:, :]
+            self.ring.pos[layer_idx, :, :, write_offsets] = (
+                positions_t[T_new - R:].view(1, 1, R).expand(B, H_kv, R)
+            )
+            self.ring.score[layer_idx, :, :, write_offsets] = init_scores[:, :, T_new - R:]
 
         # 2. Remaining tokens, ranked by initial score, distributed across tiers.
         T_rem = T_new - R
@@ -758,7 +760,6 @@ class KVCascadeCache:
             return
         R = self.ring.capacity
         device = K_new.device
-        cursor = int(self.ring_cursor[layer_idx, 0, 0].item())
 
         positions_t = torch.tensor(positions, device=device, dtype=torch.long)    # [T_new]
 
@@ -767,6 +768,21 @@ class KVCascadeCache:
                                        dtype=self.ring.score.dtype)
         else:
             init_scores = initial_scores.to(self.ring.score.dtype)
+
+        # R=0: bypass the recency ring entirely. New tokens cascade directly into the
+        # persistent tiers (strict H2O semantics — no 1-step delay). Empty cache uses the
+        # direct-assign fast path; non-empty falls through to the vectorized cascade with
+        # the new tokens themselves as the candidate stream.
+        if R == 0:
+            if self.next_pos[layer_idx] == 0:
+                self._prefill_direct_assign(layer_idx, K_new, V_new, positions_t, init_scores)
+            else:
+                cand_pos = positions_t.view(1, 1, T_new).expand(B, H_kv, T_new).contiguous()
+                cand_score = init_scores.to(torch.float32)
+                self._cascade_vectorized(layer_idx, K_new, V_new, cand_pos, cand_score)
+            return
+
+        cursor = int(self.ring_cursor[layer_idx, 0, 0].item())
 
         # Fast path for the prefill case (cache empty and T_new > R). Cascade competition
         # is degenerate when all tiers are empty: it just ranks candidates by score and
@@ -1081,6 +1097,54 @@ try:
     ALL_ATTENTION_FUNCTIONS["kvcascade"] = kvcascade_attn_function
 except ImportError:
     ALL_ATTENTION_FUNCTIONS = None
+
+
+def make_h2o_cache(
+    num_layers: int,
+    batch_size: int,
+    num_heads: int,
+    head_dim: int,
+    cache_size: int,
+    recency_window: int = 0,
+    num_kv_heads: Optional[int] = None,
+    score_policy: str = "cumulative",
+    ema_decay: float = 0.98,
+    seed: int = 0,
+    device=None,
+    dtype=torch.float32,
+) -> KVCascadeCache:
+    """Construct a KVCascadeCache configured for H2O-style operation:
+    eviction-only (no quantization), fp storage throughout.
+
+    With ``recency_window=0`` (default), this gives strict H2O semantics: every new
+    token competes for a slot based on its arrival-step attention immediately, with no
+    intermediate FIFO buffer. With ``recency_window > 0`` you get a SnapKV/H2O hybrid
+    where the K most recent tokens are always retained (the "local" window).
+
+    ``cache_size`` is the total fp slot budget (recency window + heavy-hitters tier).
+    ``score_policy="cumulative"`` matches the H2O paper's monotonic accumulated
+    attention; pass ``"ema"`` for a decaying variant.
+
+    The result is a regular ``KVCascadeCache``, so ``install_kvcascade(model, cache)``
+    integrates it with the HF dispatcher exactly the same way.
+    """
+    fp_capacity = cache_size - recency_window
+    assert fp_capacity >= 0, (
+        f"cache_size ({cache_size}) must be >= recency_window ({recency_window})"
+    )
+    return KVCascadeCache(
+        num_layers=num_layers, batch_size=batch_size,
+        num_heads=num_heads, num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        ring_size=recency_window,
+        fp_capacity=fp_capacity,
+        quant_tiers=[],
+        score_policy=score_policy,
+        ema_decay=ema_decay,
+        seed=seed,
+        device=device,
+        dtype=dtype,
+    )
 
 
 def install_kvcascade(model: nn.Module, cache: KVCascadeCache) -> int:
