@@ -64,27 +64,44 @@ class FpBuffer:
 
 
 class TurboBuffer:
-    """Fixed-capacity buffer storing TurboQuant K + PolarQuant V at given bit budgets."""
+    """Fixed-capacity buffer storing TurboQuant K + PolarQuant V at given bit budgets.
+
+    Two `quant_mode` values are supported for K:
+      - "prod": TurboQuant — (k_bits-1)-bit Lloyd-Max + 1-bit JL sketch.
+      - "mse":  PolarQuant only — k_bits-bit Lloyd-Max, no JL. Saves the JL sign
+                bytes and the residual-norm fp byte per token.
+    """
 
     def __init__(self, num_layers: int, batch_size: int, num_kv_heads: int,
                  capacity: int, head_dim: int,
                  k_bits: int, v_bits: int, m: int,
+                 quant_mode: str = "prod",
                  seed: int = 0, device=None, dtype=torch.float32):
         L, B, H, C, D = num_layers, batch_size, num_kv_heads, capacity, head_dim
+        if quant_mode not in ("prod", "mse"):
+            raise ValueError(f"quant_mode must be 'prod' or 'mse', got {quant_mode!r}")
+        self.quant_mode = quant_mode
         self.capacity = capacity
         self.head_dim = head_dim
         self.k_total_bits = k_bits
         self.v_total_bits = v_bits
-        self._k_idx_bits = k_bits - 1
+        # Storage codebook width: Prod splits off 1 bit for the JL sketch; MSE uses all.
+        self._k_idx_bits = k_bits - 1 if quant_mode == "prod" else k_bits
         self._v_idx_bits = v_bits
         self.m = m
         self.device = device
         self.dtype = dtype
 
-        self.k_quantizers = [
-            TurboQuant(k_bits, head_dim, m, seed=seed + 2 * l, device=device, dtype=dtype)
-            for l in range(num_layers)
-        ]
+        if quant_mode == "prod":
+            self.k_quantizers = [
+                TurboQuant(k_bits, head_dim, m, seed=seed + 2 * l, device=device, dtype=dtype)
+                for l in range(num_layers)
+            ]
+        else:  # mse — PolarQuant exposes a TurboQuant-shaped surface (see polar_quant.py)
+            self.k_quantizers = [
+                PolarQuant(k_bits, head_dim, seed=seed + 2 * l, device=device, dtype=dtype)
+                for l in range(num_layers)
+            ]
         self.v_quantizers = [
             PolarQuant(v_bits, head_dim, seed=seed + 2 * l + 1, device=device, dtype=dtype)
             for l in range(num_layers)
@@ -92,9 +109,15 @@ class TurboBuffer:
 
         self._bytes_k_idx  = (head_dim * self._k_idx_bits + 7) // 8
         self._bytes_v_idx  = (head_dim * self._v_idx_bits + 7) // 8
-        self._bytes_k_sign = (m + 7) // 8
+        # MSE mode: 0-byte JL sign field (no allocation cost).
+        self._bytes_k_sign = (m + 7) // 8 if quant_mode == "prod" else 0
         self._fp_bytes = torch.empty((), dtype=dtype).element_size()
 
+        # k_resnorm and k_ressign_packed are always allocated (so scatter ops in the
+        # cascade machinery work uniformly across modes) but in MSE mode k_resnorm holds
+        # only zeros and k_ressign_packed has 0 trailing channels (zero-byte). The
+        # bytes_per_token accounting reflects MSE's savings even though the allocated
+        # buffer is slightly larger than reported.
         self.k_norm           = torch.zeros(L, B, H, C,                     device=device, dtype=dtype)
         self.k_idx_packed     = torch.zeros(L, B, H, C, self._bytes_k_idx,  device=device, dtype=torch.uint8)
         self.k_resnorm        = torch.zeros(L, B, H, C,                     device=device, dtype=dtype)
@@ -108,34 +131,54 @@ class TurboBuffer:
         return self.pos[layer_idx] >= 0
 
     def bytes_per_token(self) -> int:
-        return (3 * self._fp_bytes
+        # Prod: k_norm + k_resnorm + k_idx + k_signs + v_norm + v_idx
+        # MSE:  k_norm + k_idx + v_norm + v_idx
+        k_fp = (2 if self.quant_mode == "prod" else 1) * self._fp_bytes
+        return (k_fp + self._fp_bytes                                # v_norm
                 + self._bytes_k_idx + self._bytes_k_sign + self._bytes_v_idx)
 
     def encode_batch(self, layer_idx: int, K: torch.Tensor, V: torch.Tensor):
         """Encode a [B, H_kv, T, D] batch of K, V into the tier's encoded fields.
         Returns the packed/normed components ready for scatter into storage:
             (k_norm, k_idx_packed, k_resnorm, k_ressign_packed, v_norm, v_idx_packed)
-        """
-        kq = self.k_quantizers[layer_idx].quantize(K)
-        v_norm, v_idx = self.v_quantizers[layer_idx].encode(V)
 
-        sign01 = (kq.res_signs.long() + 1) >> 1
-        k_idx_packed     = pack_bits(kq.x_indices, self._k_idx_bits)
-        k_ressign_packed = pack_bits(sign01, 1)
-        v_idx_packed     = pack_bits(v_idx, self._v_idx_bits)
-        return (kq.x_norm, k_idx_packed, kq.res_norm, k_ressign_packed,
-                v_norm, v_idx_packed)
+        In MSE mode, k_resnorm and k_ressign_packed are zero-channel placeholders
+        with shapes matching the tier's storage tensors.
+        """
+        v_norm, v_idx = self.v_quantizers[layer_idx].encode(V)
+        v_idx_packed  = pack_bits(v_idx, self._v_idx_bits)
+
+        if self.quant_mode == "prod":
+            kq = self.k_quantizers[layer_idx].quantize(K)
+            sign01 = (kq.res_signs.long() + 1) >> 1
+            k_idx_packed     = pack_bits(kq.x_indices, self._k_idx_bits)
+            k_ressign_packed = pack_bits(sign01, 1)
+            return (kq.x_norm, k_idx_packed, kq.res_norm, k_ressign_packed,
+                    v_norm, v_idx_packed)
+        else:  # mse
+            k_norm, k_idx = self.k_quantizers[layer_idx].encode(K)
+            k_idx_packed = pack_bits(k_idx, self._k_idx_bits)
+            # Match buffer shapes: k_resnorm is [B, H_kv, T] (fp), k_ressign_packed is
+            # [B, H_kv, T, 0] (0-trailing-byte). The values are unused in MSE mode.
+            B, H_kv, T = k_norm.shape
+            k_resnorm_ph        = torch.zeros_like(k_norm)
+            k_ressign_packed_ph = torch.zeros(B, H_kv, T, self._bytes_k_sign,
+                                              device=K.device, dtype=torch.uint8)
+            return (k_norm, k_idx_packed, k_resnorm_ph, k_ressign_packed_ph,
+                    v_norm, v_idx_packed)
 
     def dequantize_all(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Dequantize every slot back to fp [B, H_kv, C, D] for K and V.
         Used by the cascade when residents are demoted to a lower tier.
-        Note: the TurboQuant K reconstruction recovers only the MSE part; the QJL
-        sign bits exist solely for IP estimation and are dropped here.
+        Note: in Prod mode the K reconstruction uses only the MSE coarse code; the QJL
+        sign bits exist solely for IP estimation and are dropped here. In MSE mode
+        the full codebook is the reconstruction (no JL bits ever existed).
         """
         D = self.head_dim
         L = layer_idx
 
         k_idx = unpack_bits(self.k_idx_packed[L], self._k_idx_bits, D)               # [B, H_kv, C, D]
+        # PolarQuant.mse_quantizer == self, so this works in both modes.
         u_hat = self.k_quantizers[L].mse_quantizer.decode_rotated(k_idx)             # [B, H_kv, C, D]
         K_recon = self.k_norm[L].unsqueeze(-1) * (u_hat @ self.k_quantizers[L].R)    # [B, H_kv, C, D]
 
@@ -152,16 +195,22 @@ class TurboBuffer:
         [B, H_q, T_q, D] via .view so the matmul stays at kv-head granularity, avoiding
         the H_q-expansion that _repeat_head would materialize over storage tensors.
         Returns: [B, H_kv, n_rep * T_q, C]. Caller reshapes back to [B, H_q, T_q, C].
+
+        Prod mode: JL IP estimator.
+        MSE mode : direct (q @ K_hat^T) on dequantized K via PolarQuant.estimate_ip_pairwise.
         """
         D = self.head_dim
         k_idx = unpack_bits(self.k_idx_packed[layer_idx], self._k_idx_bits, D)        # [B, H_kv, C, D]
-        sign01 = unpack_bits(self.k_ressign_packed[layer_idx], 1, self.m)             # [B, H_kv, C, m]
-        signs = sign01.to(torch.int8) * 2 - 1
-        x_norm   = self.k_norm[layer_idx]                                              # [B, H_kv, C]
-        res_norm = self.k_resnorm[layer_idx]                                           # [B, H_kv, C]
-
-        kq = QuantizedKV(x_norm=x_norm, x_indices=k_idx,
-                         res_norm=res_norm, res_signs=signs)
+        x_norm = self.k_norm[layer_idx]                                                # [B, H_kv, C]
+        if self.quant_mode == "prod":
+            sign01 = unpack_bits(self.k_ressign_packed[layer_idx], 1, self.m)         # [B, H_kv, C, m]
+            signs = sign01.to(torch.int8) * 2 - 1
+            res_norm = self.k_resnorm[layer_idx]                                       # [B, H_kv, C]
+            kq = QuantizedKV(x_norm=x_norm, x_indices=k_idx,
+                             res_norm=res_norm, res_signs=signs)
+        else:  # mse: PolarQuant.estimate_ip_pairwise ignores res_norm/res_signs
+            kq = QuantizedKV(x_norm=x_norm, x_indices=k_idx,
+                             res_norm=x_norm, res_signs=torch.zeros_like(k_idx, dtype=torch.int8))
         return self.k_quantizers[layer_idx].estimate_ip_pairwise(kq, q_grouped)
 
     def values(self, layer_idx: int, dtype: torch.dtype) -> torch.Tensor:
@@ -200,6 +249,7 @@ class KVCascadeCache:
         num_kv_heads: Optional[int] = None,
         score_policy: str = "ema",
         ema_decay: float = 0.98,
+        quant_mode: str = "prod",
         seed: int = 0,
         device=None,
         dtype=torch.float32,
@@ -229,6 +279,8 @@ class KVCascadeCache:
         assert batch_size == 1, "v1 supports batch_size=1 only"
         assert score_policy in ("ema", "cumulative"), \
             f"score_policy must be 'ema' or 'cumulative', got {score_policy!r}"
+        assert quant_mode in ("prod", "mse"), \
+            f"quant_mode must be 'prod' or 'mse', got {quant_mode!r}"
         self.num_layers = num_layers
         self.batch_size = batch_size
         self.num_heads = num_heads                  # query heads
@@ -239,6 +291,7 @@ class KVCascadeCache:
         self.m = m if m is not None else head_dim
         self.score_policy = score_policy
         self.ema_decay = ema_decay
+        self.quant_mode = quant_mode
         self.device = device
         self.dtype = dtype
 
@@ -252,6 +305,7 @@ class KVCascadeCache:
             self.quant_buffers.append(TurboBuffer(
                 num_layers, batch_size, self.num_kv_heads,
                 cap, head_dim, k_bits=k_bits, v_bits=v_bits, m=self.m,
+                quant_mode=quant_mode,
                 seed=seed + 1000 * (i + 1), device=device, dtype=dtype,
             ))
 

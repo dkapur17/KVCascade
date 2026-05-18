@@ -1,0 +1,23 @@
+[build-system]
+requires = [
+    "setuptools>=42",
+    "wheel",
+    "torch",
+    "numpy"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turboquant-pytorch"
+version = "0.1.2"
+description = "High-performance Quantization Engine with Lloyd-Max and QJL"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "torch",
+    "scipy",
+    "numpy"
+]
+
+[tool.setuptools]
+packages = ["turboquant"]

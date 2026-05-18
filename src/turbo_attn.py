@@ -100,13 +100,33 @@ class TurboQuantKVCache:
     Storage is at **kv-head** granularity (so GQA savings are preserved). Attention
     expansion to query-head count happens at compute time.
 
-    Per-layer layout (`H_kv` = num_kv_heads):
-        k_norm           : [L, B, H_kv, T]                     fp
-        k_idx_packed     : [L, B, H_kv, T, ceil(D*(bits-1)/8)] uint8
-        k_resnorm        : [L, B, H_kv, T]                     fp
-        k_ressign_packed : [L, B, H_kv, T, ceil(m/8)]          uint8
-        v_norm           : [L, B, H_kv, T]                     fp
-        v_idx_packed     : [L, B, H_kv, T, ceil(D*bits/8)]     uint8
+    Two `quant_mode` values are supported for K:
+
+      - "prod" (default): TurboQuant Prod variant. (k_bits-1)-bit Lloyd-Max coarse
+        code + 1-bit JL residual sketch. IP estimation via the JL estimator. This
+        is what the paper recommends for keys (unbiased inner product), and what
+        all existing eval results were generated with.
+      - "mse": Pure PolarQuant on K (Algorithm 1 in the paper). k_bits-bit Lloyd-Max
+        on Haar-rotated unit-K; no JL residual. IP at score time is a direct
+        `q @ K_hat^T` on the dequantized K. Loses unbiasedness but spends the full
+        bit budget on the codebook — lower variance for the same byte budget. Some
+        community implementations argue this is empirically better on real LLM K
+        because softmax amplifies the JL variance more than the bias it removes.
+
+    Per-layer layout when `quant_mode="prod"` (`H_kv` = num_kv_heads):
+        k_norm           : [L, B, H_kv, T]                       fp
+        k_idx_packed     : [L, B, H_kv, T, ceil(D*(k_bits-1)/8)] uint8
+        k_resnorm        : [L, B, H_kv, T]                       fp
+        k_ressign_packed : [L, B, H_kv, T, ceil(m/8)]            uint8
+        v_norm           : [L, B, H_kv, T]                       fp
+        v_idx_packed     : [L, B, H_kv, T, ceil(D*bits/8)]       uint8
+
+    Per-layer layout when `quant_mode="mse"`:
+        k_norm           : [L, B, H_kv, T]                       fp
+        k_idx_packed     : [L, B, H_kv, T, ceil(D*k_bits/8)]     uint8
+        k_resnorm        : 0-byte placeholder
+        k_ressign_packed : 0-byte placeholder
+        v_norm, v_idx_packed: unchanged.
     """
 
     def __init__(self, num_layers: int, batch_size: int, num_heads: int,
@@ -117,21 +137,11 @@ class TurboQuantKVCache:
                  m: int | None = None,
                  num_kv_heads: int | None = None,
                  max_seq_len: int | None = None,
+                 quant_mode: str = "prod",
                  seed: int = 0,
                  device: torch.device | None = None,
                  dtype: torch.dtype = torch.float32):
-        """K uses TurboQuant with `k_bits` total budget per coordinate (k_bits-1 for the
-        Lloyd-Max codebook + 1 for the JL residual sketch, with m JL projections).
-        V uses PolarQuant with `v_bits` per coordinate.
-
-        K budget should be conservative (errors feed into softmax). V can be much smaller
-        (errors average out through attn @ V, and Lloyd-Max centroids are unbiased).
-        Pass either `bits` (sets both) or `k_bits` / `v_bits` to override individually.
-
-        `max_seq_len` is optional: if provided, buffers are pre-allocated to that size
-        (and overflow is an error). If None, buffers grow on demand (capacity doubles
-        on overflow).
-        """
+        """See class docstring. `quant_mode` selects Prod (default) or MSE for K."""
         self.num_layers = num_layers
         self.batch_size = batch_size
         self.num_heads = num_heads                  # query-head count
@@ -140,13 +150,16 @@ class TurboQuantKVCache:
         self.n_rep = num_heads // self.num_kv_heads
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len              # optional hard cap
+        if quant_mode not in ("prod", "mse"):
+            raise ValueError(f"quant_mode must be 'prod' or 'mse', got {quant_mode!r}")
+        self.quant_mode = quant_mode
 
         # User-facing total budgets per coordinate.
         self.k_total_bits = k_bits if k_bits is not None else bits
         self.v_total_bits = v_bits if v_bits is not None else bits
-        # Internal storage bits: K uses (total - 1) for MSE indices (1 bit goes to JL sketch),
-        # V uses all bits for PolarQuant.
-        self.k_bits = self.k_total_bits - 1
+        # Internal storage bits: Prod K uses (total - 1) for MSE indices (1 bit -> JL sketch).
+        # MSE K uses all `k_total_bits` for the codebook.
+        self.k_bits = self.k_total_bits - 1 if quant_mode == "prod" else self.k_total_bits
         self.v_bits = self.v_total_bits
         self.m = m if m is not None else head_dim
         self.device = device
@@ -155,14 +168,22 @@ class TurboQuantKVCache:
         # Pre-compute trailing storage sizes (so bytes_per_token is buffer-independent).
         self._bytes_k_idx  = (head_dim * self.k_bits + 7) // 8
         self._bytes_v_idx  = (head_dim * self.v_bits + 7) // 8
-        self._bytes_k_sign = (self.m + 7) // 8
+        # In MSE mode, no JL sketch stored.
+        self._bytes_k_sign = (self.m + 7) // 8 if quant_mode == "prod" else 0
         self._fp_bytes = torch.empty((), dtype=dtype).element_size()
 
-        self.k_quantizers = [
-            TurboQuant(self.k_total_bits, head_dim, self.m, seed=seed + 2 * l,
-                       device=device, dtype=dtype)
-            for l in range(num_layers)
-        ]
+        if quant_mode == "prod":
+            self.k_quantizers = [
+                TurboQuant(self.k_total_bits, head_dim, self.m, seed=seed + 2 * l,
+                           device=device, dtype=dtype)
+                for l in range(num_layers)
+            ]
+        else:  # mse
+            self.k_quantizers = [
+                PolarQuant(self.k_total_bits, head_dim, seed=seed + 2 * l,
+                           device=device, dtype=dtype)
+                for l in range(num_layers)
+            ]
         self.v_quantizers = [
             PolarQuant(self.v_total_bits, head_dim, seed=seed + 2 * l + 1,
                        device=device, dtype=dtype)
@@ -193,6 +214,8 @@ class TurboQuantKVCache:
             new_cap = min(new_cap, self.max_seq_len)
 
         L, B, H_kv = self.num_layers, self.batch_size, self.num_kv_heads
+        # In MSE mode k_resnorm / k_ressign_packed exist as 0-byte/0-channel placeholders
+        # so the field paths in update()/attention() stay uniform without a `is not None` check.
         fields = [
             ("k_norm",           self.dtype,      ()),
             ("k_idx_packed",     torch.uint8,     (self._bytes_k_idx,)),
@@ -214,11 +237,16 @@ class TurboQuantKVCache:
         self.cur_len = [0] * self.num_layers
 
     def bytes_per_token(self) -> int:
-        """Per-(layer, kv-head, token) storage cost in bytes."""
+        """Per-(layer, kv-head, token) storage cost in bytes.
+
+        Prod: k_norm + k_resnorm + k_idx + k_signs + v_norm + v_idx
+        MSE : k_norm + k_idx + v_norm + v_idx   (no JL norm/signs)
+        """
+        k_fp_bytes = (2 if self.quant_mode == "prod" else 1) * self._fp_bytes
         return (
-            2 * self._fp_bytes                      # k_norm + k_resnorm
+            k_fp_bytes
             + self._bytes_k_idx
-            + self._bytes_k_sign
+            + self._bytes_k_sign                    # 0 in mse mode
             + self._fp_bytes                        # v_norm
             + self._bytes_v_idx
         )
@@ -234,12 +262,18 @@ class TurboQuantKVCache:
         s, e = self.cur_len[layer_idx], self.cur_len[layer_idx] + T_new
         self._grow(e)
 
-        kq = self.k_quantizers[layer_idx].quantize(k_new)
-        self.k_norm[layer_idx, :, :, s:e]    = kq.x_norm
-        self.k_resnorm[layer_idx, :, :, s:e] = kq.res_norm
-        self.k_idx_packed[layer_idx, :, :, s:e]     = pack_bits(kq.x_indices, self.k_bits)
-        sign01 = (kq.res_signs.long() + 1) >> 1                         # {-1,+1} -> {0,1}
-        self.k_ressign_packed[layer_idx, :, :, s:e] = pack_bits(sign01, 1)
+        if self.quant_mode == "prod":
+            kq = self.k_quantizers[layer_idx].quantize(k_new)
+            self.k_norm[layer_idx, :, :, s:e]    = kq.x_norm
+            self.k_resnorm[layer_idx, :, :, s:e] = kq.res_norm
+            self.k_idx_packed[layer_idx, :, :, s:e] = pack_bits(kq.x_indices, self.k_bits)
+            sign01 = (kq.res_signs.long() + 1) >> 1                         # {-1,+1} -> {0,1}
+            self.k_ressign_packed[layer_idx, :, :, s:e] = pack_bits(sign01, 1)
+        else:  # mse
+            k_norm_v, k_idx = self.k_quantizers[layer_idx].encode(k_new)
+            self.k_norm[layer_idx, :, :, s:e]       = k_norm_v
+            self.k_idx_packed[layer_idx, :, :, s:e] = pack_bits(k_idx, self.k_bits)
+            # k_resnorm and k_ressign_packed are 0-byte placeholders in mse mode.
 
         v_norm, v_idx = self.v_quantizers[layer_idx].encode(v_new)
         self.v_norm[layer_idx, :, :, s:e]       = v_norm
@@ -249,7 +283,8 @@ class TurboQuantKVCache:
         return e
 
     def _key_view(self, layer_idx: int, T: int) -> QuantizedKV:
-        """Unpack K view at kv-head granularity and expand to query-head count."""
+        """Prod-mode only: unpack K view at kv-head granularity for the JL-IP estimator.
+        Not called in MSE mode (which goes through `_key_dequant_fp` instead)."""
         k_idx = unpack_bits(self.k_idx_packed[layer_idx, :, :, :T],
                             self.k_bits, self.head_dim)              # [B, H_kv, T, D]
         sign01 = unpack_bits(self.k_ressign_packed[layer_idx, :, :, :T], 1, self.m)
@@ -269,6 +304,16 @@ class TurboQuantKVCache:
             res_norm=res_norm,
             res_signs=signs,
         )
+
+    def _key_dequant_fp(self, layer_idx: int, T: int) -> torch.Tensor:
+        """MSE-mode K reconstruction. Returns K_hat: [B, H_kv (* n_rep), T, D]."""
+        D = self.head_dim
+        k_idx = unpack_bits(self.k_idx_packed[layer_idx, :, :, :T], self.k_bits, D)  # [B, H_kv, T, D]
+        k_norm = self.k_norm[layer_idx, :, :, :T]                                    # [B, H_kv, T]
+        K_hat = self.k_quantizers[layer_idx].decode(k_norm, k_idx)                   # [B, H_kv, T, D]
+        if self.n_rep > 1:
+            K_hat = _repeat_head(K_hat, self.n_rep)
+        return K_hat
 
     def attention(self, layer_idx: int, q: torch.Tensor,
                   k_new: torch.Tensor | None = None,
@@ -300,10 +345,14 @@ class TurboQuantKVCache:
         # ----- scores -----
         score_chunks: list[torch.Tensor] = []
         if T_prefix > 0:
-            kq_view = self._key_view(layer_idx, T_prefix)
-            score_chunks.append(
-                self.k_quantizers[layer_idx].estimate_ip_pairwise(kq_view, q) * scaling
-            )
+            if self.quant_mode == "prod":
+                kq_view = self._key_view(layer_idx, T_prefix)
+                score_chunks.append(
+                    self.k_quantizers[layer_idx].estimate_ip_pairwise(kq_view, q) * scaling
+                )
+            else:  # mse: direct (Q @ K_hat^T) on dequantized K
+                K_hat = self._key_dequant_fp(layer_idx, T_prefix)
+                score_chunks.append((q @ K_hat.transpose(-1, -2)) * scaling)
         if T_new > 0:
             k_new_q = _repeat_head(k_new, self.n_rep) if self.n_rep > 1 else k_new
             score_chunks.append((q @ k_new_q.transpose(-1, -2)) * scaling)

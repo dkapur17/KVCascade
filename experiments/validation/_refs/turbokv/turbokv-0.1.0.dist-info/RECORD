@@ -1,0 +1,9 @@
+turboquant/__init__.py,sha256=x7hG9Wie1nh5VV3TwjYjjTExQ4rBCsZ2R3c3UGpHfSE,153
+turboquant/cache.py,sha256=djrha7DqWHPc3pvWJixGZIUBYSwWwAlBScNp25Yanug,5202
+turboquant/codebook.py,sha256=iXTrDa55niUDHE97E8gQyB_ymCs5vbxJFmpGU0TaiWY,4775
+turboquant/packing.py,sha256=DpOOp1X27X34gPjxddNGIWR3sCzxk1K6qkalhgVIH1A,2393
+turboquant/quantizer.py,sha256=XZ-o6T9hOMcRu3Iz8sDbAdnvUU33QgxwC9gSTHzfl-s,4339
+turbokv-0.1.0.dist-info/METADATA,sha256=JfCf2OM4jAWwAQ6agM6-ldYllR7zVazgZeqx5ZQTIJg,7404
+turbokv-0.1.0.dist-info/WHEEL,sha256=aeYiig01lYGDzBgS8HxWXOg3uV61G9ijOsup-k9o1sk,91
+turbokv-0.1.0.dist-info/top_level.txt,sha256=BYiGbbKgP4YCfM99wJNacatN3tBOqpCAHx1TKqKtxmg,11
+turbokv-0.1.0.dist-info/RECORD,,

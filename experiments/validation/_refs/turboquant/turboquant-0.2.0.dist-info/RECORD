@@ -1,0 +1,11 @@
+turboquant/__init__.py,sha256=EOakHGG21R_q4ijwE0pwpM6wy6jLAMiFUzGCO1WmEQM,568
+turboquant/cache.py,sha256=O0O3yXhn4unxHYnuQMTGqwBbpX77z0Qu_C4Jmcz2OfU,10511
+turboquant/core.py,sha256=WC3eLCLyqThplvl4sJl3dOqGd2-5PuSrvZuGTrjo2PM,13664
+turboquant/cuda_accel.py,sha256=yhjkQr39Gw3sh8jeSgdPvpDAo3iyqU_hzWLv0IdWWzg,1973
+turboquant/server.py,sha256=eUAcYXKEKx9zlEqh263DfAl8Jn5i_Yv6rxTQTPZOxcM,9398
+turboquant-0.2.0.dist-info/licenses/LICENSE,sha256=fs2M4dMLiqJiMvXHyHjMpTvCc1R85S8WePlVFUdG5k8,709
+turboquant-0.2.0.dist-info/METADATA,sha256=yJfKOdYZpFgNMEpa0zIeAoO3zuHQnGE8bGVClwh-mGo,10971
+turboquant-0.2.0.dist-info/WHEEL,sha256=aeYiig01lYGDzBgS8HxWXOg3uV61G9ijOsup-k9o1sk,91
+turboquant-0.2.0.dist-info/entry_points.txt,sha256=lyYz3r6VbX-D3DxuF5rsatC3-Yn7DmTGgcEZCk9pAVU,61
+turboquant-0.2.0.dist-info/top_level.txt,sha256=BYiGbbKgP4YCfM99wJNacatN3tBOqpCAHx1TKqKtxmg,11
+turboquant-0.2.0.dist-info/RECORD,,

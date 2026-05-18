@@ -8,11 +8,19 @@ ones at full precision, and the unimportant tail evicted entirely. Importance
 is driven per (layer, kv-head) by a decaying score on accumulated attention received,
 so each head independently decides which tokens to keep.
 
-Compression on what's kept is done with [TurboQuant](https://arxiv.org/abs/2504.16127)
-(norm + Haar-rotated Lloyd-Max + 1-bit JL residual sketch). Eviction is in the
+Compression on what's kept is done with [TurboQuant](https://arxiv.org/abs/2504.19874)
+(norm + Haar-rotated Lloyd-Max, optionally with a 1-bit JL residual sketch). Eviction is in the
 spirit of [H2O](https://arxiv.org/abs/2306.14048) / [SnapKV](https://arxiv.org/abs/2404.14469).
 The combination — quantize what you keep, evict what you don't — gives a Pareto
 improvement over either approach alone on long-context language modeling.
+
+> **2026-05 update**: TurboQuant has two variants — `Prod` (Lloyd-Max coarse code + 1-bit
+> JL sketch on the residual, for unbiased inner products) and `MSE` (Lloyd-Max only, no JL).
+> The validation sprint in `experiments/validation/` found that **MSE empirically beats Prod
+> on real K vectors** for sequential-decode top-1 (Qwen3-0.6B at ctx=4096: uniform-MSE 85.9%
+> vs uniform-Prod 68.6%, +17.3 pp at iso-byte). Default mode is now `--quant-mode mse`; the
+> `Prod` numbers in the Headline tables below are kept for reproducibility but represent the
+> pre-2026-05 baseline. See `experiments/validation/SUMMARY.md` for the full analysis.
 
 ```mermaid
 flowchart TD
@@ -42,6 +50,8 @@ are mean ± standard deviation across the 50 wikitext chunks.
 At the same total cache byte budget, KVCascade beats uniform on every (model, context)
 pair tested:
 
+#### Prod variant (pre-2026-05 baseline, kept for reproducibility)
+
 | Model | ctx | uniform | H2O (ring=0) | H2O (ring=8) | **KVCascade** | **Δ vs uniform** |
 |---|---|---|---|---|---|---|
 | Qwen3-0.6B | 4096 | 70.3 ± 8.0 | 20.5 ± 5.6 | 74.0 ± 6.0 | **86.7 ± 5.5** | **+16.4 pp** |
@@ -51,10 +61,25 @@ pair tested:
 | OLMo-2-1B | 4096 | 90.7 ± 3.8 | 25.1 ± 7.2 | 79.2 ± 4.9 | **96.8 ± 2.2** | **+6.1 pp** |
 | OLMo-2-1B | 8192 | 80.2 ± 5.6 | 63.7 ± 9.7 | 65.2 ± 9.2 | **92.6 ± 2.8** | **+12.4 pp** |
 
-The win ranges from **+6.1 pp** (Llama / OLMo at short context, where uniform is already
-strong) to **+16.4 pp** (Qwen3 at short context, where uniform is weakest). KVCascade
-also has the lowest variance of any compressed config — sd shrinks to ~2 pp on Llama and
-OLMo at 4k vs ~5 pp for uniform.
+These numbers use `--quant-mode prod` (TurboQuant Prod variant). Run via
+`python eval.py --model … --quant-mode prod` to reproduce.
+
+#### MSE variant (current default, partial grid)
+
+Replacing TurboQuant's JL residual sketch with pure Lloyd-Max (`--quant-mode mse`) lifts
+both the uniform baseline AND KVCascade. The full 6-config × 50-sample grid is queued for
+Modal; preliminary numbers on Qwen3-0.6B at ctx=4096 (20 samples on RTX 3060):
+
+| Model | ctx | uniform-MSE | KVCascade-MSE | Δ vs uniform-MSE |
+|---|---|---|---|---|
+| Qwen3-0.6B | 4096 | **85.9 ± 5.0** | **95.4 ± 2.6** | **+9.5 pp** |
+
+The Δ shrinks from `+16.4 pp` (Prod-vs-Prod) to `+9.5 pp` (MSE-vs-MSE) because the Prod baseline was artificially weak — the JL sketch's variance under softmax was costing the uniform-Prod baseline ~17 pp of top-1 on Qwen3. KVCascade still wins by a meaningful margin in MSE mode. See `experiments/validation/quant_mode_comparison.md`.
+
+The Prod-mode win ranges from **+6.1 pp** (Llama / OLMo at short context, where uniform is
+already strong) to **+16.4 pp** (Qwen3 at short context, where uniform-Prod is weakest).
+KVCascade also has the lowest variance of any compressed config — sd shrinks to ~2 pp on
+Llama and OLMo at 4k vs ~5 pp for uniform.
 
 ### Sub-iso-byte: KVCascade matches uniform with much less memory
 
@@ -194,6 +219,19 @@ SDPA flows through unchanged.
     Decaying, workload-independent, adaptive.
   - `"cumulative"` — H2O-style monotonic sum. Strictly preserves what's been hot
     historically. We've found EMA slightly outperforms cumulative on sequential decode.
+- **`quant_mode`**: which TurboQuant variant to use for the quant tier(s).
+  - `"prod"` — TurboQuant Prod (paper Algorithm 2): `(k_bits-1)`-bit Lloyd-Max coarse
+    code + 1-bit JL residual sketch. IP scoring uses the unbiased JL estimator. This
+    is the paper's recommended variant for keys and reproduces our pre-2026-05 numbers.
+  - `"mse"` (default as of 2026-05) — Pure Lloyd-Max on rotated K (paper Algorithm 1).
+    Spends the full `k_bits` budget on the codebook; no JL sketch. IP scoring is a
+    direct `q @ K̂ᵀ` on dequantized K. Saves an fp byte per slot, ~30% faster on decode
+    (no JL matmul), and on real Qwen3-0.6B at ctx=4096 gives the uniform baseline
+    +17 pp top-1 vs Prod. The brief in `experiments/validation/SUMMARY.md` explains
+    when this can go the other way (when the unbiased-IP property is load-bearing —
+    rare in practice).
+  - The same flag is plumbed through `eval.py` as `--quant-mode {prod,mse}` and applies
+    to both the uniform baseline and KVCascade's quant tier in the iso-byte comparison.
 
 For sizing, a useful starting point at iso-byte versus uniform `k=6/v=2`:
 `ring_size=8`, `fp_capacity=ctx_len // 16`, `quant_tiers=[(6, 2, ~ctx_len * 13/16)]`.
@@ -314,10 +352,15 @@ every attention module. Works on any model that dispatches through ALL_ATTENTION
 
 KVCascade builds directly on ideas from prior work on KV-cache compression:
 
-- **[TurboQuant](https://arxiv.org/abs/2504.16127)** (Mahankali et al., 2025) —
-  norm + Haar-rotated Lloyd-Max coarse code + 1-bit JL residual sketch is the
+- **[TurboQuant](https://arxiv.org/abs/2504.19874)** (Zandieh, Daliri, Hadian, Mirrokni, ICLR 2026) —
+  norm + Haar-rotated Lloyd-Max coarse code, optionally with a 1-bit JL residual sketch, is the
   per-token compression primitive used in KVCascade's quant tiers. The cascade
   hierarchy is what's new on top.
+- **[scos-lab/turboquant](https://github.com/scos-lab/turboquant)** — independent
+  reproduction that empirically argues MSE-only beats Prod (paper's recommended IP-variant)
+  on real attention because softmax amplifies the JL sketch's variance more than the bias
+  it removes. We validated this on Qwen3-0.6B (+17 pp uniform top-1 at iso-byte) and
+  made `quant_mode="mse"` the default in 2026-05.
 - **[H2O](https://arxiv.org/abs/2306.14048)** (Zhang et al., 2023) — accumulated-
   attention scoring for "heavy hitter" identification. The fp tier's importance-driven
   retention and the cascade's eviction-on-loss policy are H2O in spirit, generalized
@@ -328,6 +371,13 @@ KVCascade builds directly on ideas from prior work on KV-cache compression:
 - **[StreamingLLM](https://arxiv.org/abs/2309.17453)** (Xiao et al., 2024) — the
   "attention sinks" insight (a few persistent high-attention tokens carry
   disproportionate weight) motivates keeping the importance-managed fp tier always-on.
+
+Cross-checked against four community TurboQuant implementations during validation:
+[vivekvar-dl/turbokv](https://github.com/vivekvar-dl/turboquant),
+[hackimov/turboquant-kv](https://github.com/hackimov/turboquant-kv),
+[back2matching/turboquant](https://github.com/back2matching/turboquant),
+and [tonbistudio/turboquant-pytorch](https://github.com/tonbistudio/turboquant-pytorch).
+Full audit in `experiments/validation/`.
 
 This codebase was developed as the course project for **CMU 15-642: Machine Learning
 Systems** (Spring 2026).

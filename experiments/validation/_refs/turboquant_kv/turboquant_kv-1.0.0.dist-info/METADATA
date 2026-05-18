@@ -1,0 +1,28 @@
+Metadata-Version: 2.4
+Name: turboquant-kv
+Version: 1.0.0
+Summary: Open-source implementation of Google TurboQuant for extreme KV-cache compression
+Home-page: https://github.com/hackimov/turboquant-kv
+Author: hackimov
+Project-URL: Source, https://github.com/hackimov/turboquant-kv
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.8
+License-File: LICENSE
+Requires-Dist: torch>=2.0.0
+Requires-Dist: numpy
+Provides-Extra: triton
+Requires-Dist: triton-windows; platform_system == "Windows" and extra == "triton"
+Requires-Dist: triton; platform_system != "Windows" and extra == "triton"
+Provides-Extra: hf
+Requires-Dist: transformers>=4.48.0; extra == "hf"
+Dynamic: author
+Dynamic: classifier
+Dynamic: home-page
+Dynamic: license-file
+Dynamic: project-url
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary

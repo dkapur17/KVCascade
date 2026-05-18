@@ -1,0 +1,2 @@
+[console_scripts]
+turboquant-server = turboquant.server:main

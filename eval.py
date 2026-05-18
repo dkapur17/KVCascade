@@ -79,6 +79,13 @@ def parse_args():
     p.add_argument("--v-bits", type=int, default=2)
     p.add_argument("--ring-size", type=int, default=8,
                    help="KVCascade recency ring size (default: 8)")
+    p.add_argument("--quant-mode", default="prod", choices=("prod", "mse"),
+                   help="K quantization variant for uniform + KVCascade caches: "
+                        "'prod' (TurboQuant Prod = MSE coarse + 1-bit JL sketch, default) "
+                        "or 'mse' (PolarQuant only, no JL). MSE saves a fp byte per token "
+                        "and typically lowers attention reconstruction error on real K, at "
+                        "the cost of losing the unbiased-IP guarantee. Default 'prod' "
+                        "matches all pre-2026-05 eval numbers in the README.")
     p.add_argument("--exp1-ratios", default="1.0,0.5,0.25,0.125,0.0625",
                    help="Comma-separated byte ratios (× uniform iso-byte) for Exp 1")
     p.add_argument("--exp3-fp-caps", default="0,32,64,128,256,512,1024",
@@ -188,22 +195,34 @@ def fp_slot_bytes(dims: dict, dtype) -> int:
     return 2 * dims["head_dim"] * torch.empty((), dtype=dtype).element_size()
 
 
-def turbo_slot_bytes(dims: dict, dtype, k_bits: int, v_bits: int, m: int = None) -> int:
+def turbo_slot_bytes(dims: dict, dtype, k_bits: int, v_bits: int,
+                     m: int = None, quant_mode: str = "prod") -> int:
+    """Per-slot bytes for a TurboQuant K + PolarQuant V quantized cache slot.
+
+    Prod: 3 fp (k_norm, k_resnorm, v_norm) + (k_bits-1) coarse + 1-bit JL sketch + v_idx
+    MSE : 2 fp (k_norm, v_norm) + k_bits coarse + 0 JL + v_idx
+    """
     if m is None:
         m = dims["head_dim"]
     fp = torch.empty((), dtype=dtype).element_size()
     D = dims["head_dim"]
-    return (3 * fp                            # k_norm, k_resnorm, v_norm
-            + (D * (k_bits - 1) + 7) // 8     # k_idx_packed
-            + (D * v_bits + 7) // 8           # v_idx_packed
-            + (m + 7) // 8)                   # k_ressign_packed (1 bit per m)
+    if quant_mode == "prod":
+        return (3 * fp                            # k_norm, k_resnorm, v_norm
+                + (D * (k_bits - 1) + 7) // 8     # k_idx_packed
+                + (D * v_bits + 7) // 8           # v_idx_packed
+                + (m + 7) // 8)                   # k_ressign_packed
+    else:  # mse
+        return (2 * fp                            # k_norm, v_norm
+                + (D * k_bits + 7) // 8           # k_idx_packed (full bit budget)
+                + (D * v_bits + 7) // 8)          # v_idx_packed
 
 
 def kvc_qt_cap_at_budget(target_bytes_per_lh: int, ring_size: int, fp_capacity: int,
-                          dims: dict, dtype, k_bits: int, v_bits: int) -> int:
+                          dims: dict, dtype, k_bits: int, v_bits: int,
+                          quant_mode: str = "prod") -> int:
     fp_b = (ring_size + fp_capacity) * fp_slot_bytes(dims, dtype)
     rem = target_bytes_per_lh - fp_b
-    return max(0, rem // turbo_slot_bytes(dims, dtype, k_bits, v_bits))
+    return max(0, rem // turbo_slot_bytes(dims, dtype, k_bits, v_bits, quant_mode=quant_mode))
 
 
 def fp16_baseline_bytes(args, dims: dict, dtype) -> int:
@@ -220,6 +239,7 @@ def make_uniform(args, dims: dict, dtype, device):
         num_heads=dims["n_heads"], num_kv_heads=dims["n_kv_heads"],
         head_dim=dims["head_dim"], max_seq_len=args.ctx_len,
         k_bits=args.k_bits, v_bits=args.v_bits, m=dims["head_dim"],
+        quant_mode=getattr(args, "quant_mode", "prod"),
         seed=args.seed, device=device, dtype=dtype,
     )
 
@@ -244,6 +264,7 @@ def make_kvc(args, dims: dict, dtype, device, ring_size: int, fp_capacity: int, 
         ring_size=ring_size, fp_capacity=fp_capacity,
         quant_tiers=quant_tiers,
         m=dims["head_dim"], score_policy="ema",
+        quant_mode=getattr(args, "quant_mode", "prod"),
         seed=args.seed, device=device, dtype=dtype,
     )
 
@@ -472,7 +493,7 @@ def exp1_compression_sweep(model, samples, ref_decs, args, dims, dtype, device,
     print("Experiment 1: compression sweep")
     print("=" * 70)
 
-    UB = args.ctx_len * turbo_slot_bytes(dims, dtype, args.k_bits, args.v_bits)
+    UB = args.ctx_len * turbo_slot_bytes(dims, dtype, args.k_bits, args.v_bits, quant_mode=args.quant_mode)
     ratios = [float(r) for r in args.exp1_ratios.split(",") if r.strip()]
 
     print("running uniform k=6/v=2...", flush=True)
@@ -488,7 +509,7 @@ def exp1_compression_sweep(model, samples, ref_decs, args, dims, dtype, device,
         # stays roughly constant across ratios.
         fp_cap = max(8, int(round(args.ctx_len * ratio / 16)))
         qt_cap = int(kvc_qt_cap_at_budget(target, args.ring_size, fp_cap, dims, dtype,
-                                           args.k_bits, args.v_bits))
+                                           args.k_bits, args.v_bits, quant_mode=args.quant_mode))
         label = f"KVC @ {ratio:>6.4f}x  (ring={args.ring_size}, fp={fp_cap}, qt={qt_cap})"
         print(f"running {label}", flush=True)
         cache = make_kvc(args, dims, dtype, device, args.ring_size, fp_cap, qt_cap)
@@ -537,7 +558,7 @@ def exp2_iso_byte(model, samples, ref_decs, args, dims, dtype, device,
     print("Experiment 2: iso-byte head-to-head")
     print("=" * 70)
 
-    UB = args.ctx_len * turbo_slot_bytes(dims, dtype, args.k_bits, args.v_bits)
+    UB = args.ctx_len * turbo_slot_bytes(dims, dtype, args.k_bits, args.v_bits, quant_mode=args.quant_mode)
     fp16_total = fp16_baseline_bytes(args, dims, dtype)
 
     # Full-fp upper bound by construction.
@@ -589,7 +610,7 @@ def exp2_iso_byte(model, samples, ref_decs, args, dims, dtype, device,
     if kvc_iso is None:
         fp_cap = args.ctx_len // 16
         qt_cap = int(kvc_qt_cap_at_budget(UB, args.ring_size, fp_cap, dims, dtype,
-                                           args.k_bits, args.v_bits))
+                                           args.k_bits, args.v_bits, quant_mode=args.quant_mode))
         label = f"KVC @ 1x (ring={args.ring_size}, fp={fp_cap}, qt={qt_cap})"
         print(f"running {label}", flush=True)
         cache = make_kvc(args, dims, dtype, device, args.ring_size, fp_cap, qt_cap)
@@ -638,13 +659,13 @@ def exp3_split_sweep(model, samples, ref_decs, args, dims, dtype, device,
     print("Experiment 3: split sweep at fixed budget")
     print("=" * 70)
 
-    UB = args.ctx_len * turbo_slot_bytes(dims, dtype, args.k_bits, args.v_bits)
+    UB = args.ctx_len * turbo_slot_bytes(dims, dtype, args.k_bits, args.v_bits, quant_mode=args.quant_mode)
     fp_caps = [int(c) for c in args.exp3_fp_caps.split(",") if c.strip()]
 
     rows = []
     for fp_cap in fp_caps:
         qt_cap = int(kvc_qt_cap_at_budget(UB, args.ring_size, fp_cap, dims, dtype,
-                                           args.k_bits, args.v_bits))
+                                           args.k_bits, args.v_bits, quant_mode=args.quant_mode))
         if qt_cap <= 0 and fp_cap > 0:
             print(f"skipping fp_cap={fp_cap}: budget exhausted (qt_cap=0)", flush=True)
             continue

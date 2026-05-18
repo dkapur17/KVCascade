@@ -1,0 +1,6 @@
+include README.md
+include README_zh.md
+recursive-include turboquant *.cpp *.h *.py
+global-exclude *.png
+global-exclude *.jpg
+global-exclude .DS_Store
