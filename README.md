@@ -314,7 +314,7 @@ every attention module. Works on any model that dispatches through ALL_ATTENTION
 
 KVCascade builds directly on ideas from prior work on KV-cache compression:
 
-- **[TurboQuant](https://arxiv.org/abs/2504.16127)** (Mahankali et al., 2025) —
+- **[TurboQuant](https://arxiv.org/abs/2504.19874)** (Mahankali et al., 2025) —
   norm + Haar-rotated Lloyd-Max coarse code + 1-bit JL residual sketch is the
   per-token compression primitive used in KVCascade's quant tiers. The cascade
   hierarchy is what's new on top.
